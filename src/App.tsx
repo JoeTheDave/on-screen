@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import MenuModal from './components/MenuModal'
 import FourierEpicycles from './visualizations/FourierEpicycles'
 import ParticleFlowField from './visualizations/ParticleFlowField'
@@ -8,10 +8,21 @@ const VISUALIZATIONS = [
   { id: 'flow-field', name: 'Particle Flow Field', component: ParticleFlowField },
 ]
 
+const STORAGE_KEY = 'on-screen-current-viz'
+
 function App() {
   const [isHovered, setIsHovered] = useState(false)
   const [isMenuOpen, setIsMenuOpen] = useState(false)
-  const [currentViz, setCurrentViz] = useState('fourier')
+  const [currentViz, setCurrentViz] = useState(() => {
+    // Load from localStorage on initial mount
+    const stored = localStorage.getItem(STORAGE_KEY)
+    return stored || 'fourier'
+  })
+
+  // Save to localStorage whenever currentViz changes
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, currentViz)
+  }, [currentViz])
 
   const CurrentVisualization = VISUALIZATIONS.find(v => v.id === currentViz)?.component || FourierEpicycles
 
