@@ -1,9 +1,11 @@
 import { useState } from 'react'
 import MenuModal from './components/MenuModal'
 import FourierEpicycles from './visualizations/FourierEpicycles'
+import ParticleFlowField from './visualizations/ParticleFlowField'
 
 const VISUALIZATIONS = [
   { id: 'fourier', name: 'Fourier Epicycles', component: FourierEpicycles },
+  { id: 'flow-field', name: 'Particle Flow Field', component: ParticleFlowField },
 ]
 
 function App() {
