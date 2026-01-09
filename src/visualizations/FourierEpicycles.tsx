@@ -36,7 +36,7 @@ export default function FourierEpicycles() {
   const rotationRef = useRef<RotationAngles>({ angle1: -Math.PI / 2, angle2: -Math.PI / 2 })
   const segmentsRef = useRef<Segments | null>(null)
   const prevTipRef = useRef<Point | null>(null)
-  const traceColorRef = useRef<string | null>(null)
+  const traceColorsRef = useRef<{ slow: [number, number, number]; fast: [number, number, number] } | null>(null)
   const frameCountRef = useRef(0)
 
   // Handle window resize to keep canvas square based on smallest dimension
@@ -71,12 +71,37 @@ export default function FourierEpicycles() {
 
     /**
      * Generate random HSL color with high saturation and medium-high lightness
+     * Returns [hue, saturation, lightness] tuple
      */
-    const generateRandomColor = (): string => {
+    const generateRandomColor = (): [number, number, number] => {
       const hue = Math.floor(Math.random() * 360)
       const saturation = 70 + Math.floor(Math.random() * 30) // 70-100%
       const lightness = 50 + Math.floor(Math.random() * 20) // 50-70%
-      return `hsl(${hue}, ${saturation}%, ${lightness}%)`
+      return [hue, saturation, lightness]
+    }
+
+    /**
+     * Interpolate between two HSL colors based on ratio (0-1)
+     */
+    const interpolateColor = (color1: [number, number, number], color2: [number, number, number], ratio: number): string => {
+      const [h1, s1, l1] = color1
+      const [h2, s2, l2] = color2
+      
+      // Interpolate hue (accounting for circular nature of hue)
+      let hue: number
+      const diff = h2 - h1
+      if (Math.abs(diff) <= 180) {
+        hue = h1 + diff * ratio
+      } else {
+        // Take the shorter path around the color wheel
+        const shortDiff = diff > 0 ? diff - 360 : diff + 360
+        hue = (h1 + shortDiff * ratio + 360) % 360
+      }
+      
+      const saturation = s1 + (s2 - s1) * ratio
+      const lightness = l1 + (l2 - l1) * ratio
+      
+      return `hsl(${Math.round(hue)}, ${Math.round(saturation)}%, ${Math.round(lightness)}%)`
     }
 
     /**
@@ -128,7 +153,10 @@ export default function FourierEpicycles() {
         speed2,
       }
 
-      traceColorRef.current = generateRandomColor()
+      // Generate two complementary colors for the gradient
+      const color1 = generateRandomColor()
+      const color2 = generateRandomColor()
+      traceColorsRef.current = { slow: color1, fast: color2 }
     }
 
     // Initialize/reinitialize on every size change to start fresh
@@ -138,7 +166,7 @@ export default function FourierEpicycles() {
      * Main animation loop
      */
     const animate = () => {
-      if (!segmentsRef.current || !traceColorRef.current) return
+      if (!segmentsRef.current || !traceColorsRef.current) return
 
       frameCountRef.current++
 
@@ -181,7 +209,18 @@ export default function FourierEpicycles() {
 
         // Draw trace line from previous position to current
         if (prevTipRef.current) {
-          ctx1.strokeStyle = traceColorRef.current
+          // Calculate distance using distance formula
+          const dx = x2 - prevTipRef.current.x
+          const dy = y2 - prevTipRef.current.y
+          const distance = Math.sqrt(dx * dx + dy * dy)
+          console.log(`Line segment length: ${distance.toFixed(2)}`)
+
+          // Map distance to color gradient (0-60 range)
+          const maxDistance = 60
+          const ratio = Math.min(distance / maxDistance, 1)
+          const color = interpolateColor(traceColorsRef.current.slow, traceColorsRef.current.fast, ratio)
+
+          ctx1.strokeStyle = color
           ctx1.lineWidth = LINE_WIDTH
           ctx1.beginPath()
           ctx1.moveTo(prevTipRef.current.x, prevTipRef.current.y)
