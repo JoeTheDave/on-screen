@@ -5,6 +5,7 @@ import ParticleFlowField from './visualizations/ParticleFlowField'
 import FlockingBoids from './visualizations/FlockingBoids'
 import ConwayGameOfLife from './visualizations/ConwayGameOfLife'
 import VoronoiDiagrams from './visualizations/VoronoiDiagrams'
+import OrbitingLights from './visualizations/OrbitingLights'
 
 const VISUALIZATIONS = [
   { id: 'fourier', name: 'Fourier Epicycles', component: FourierEpicycles },
@@ -12,6 +13,7 @@ const VISUALIZATIONS = [
   { id: 'flocking-boids', name: 'Flocking Boids', component: FlockingBoids },
   { id: 'game-of-life', name: "Game of Life", component: ConwayGameOfLife },
   { id: 'voronoi', name: 'Voronoi Diagrams', component: VoronoiDiagrams },
+  { id: 'orbiting-lights', name: 'Orbiting Lights', component: OrbitingLights },
 ]
 
 const STORAGE_KEY = 'on-screen-current-viz'
