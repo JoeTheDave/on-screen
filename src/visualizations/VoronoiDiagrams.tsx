@@ -6,12 +6,27 @@ interface Point {
   vx: number
   vy: number
   hue: number
+  prevX: number
+  prevY: number
+  speed: number
+  cellSize: number
 }
 
 const SEED_COUNT = 250
 const SEED_SPEED = 1.5
 const REPULSION_FORCE = 0.5
 const MIN_DISTANCE = 50
+const WALL_REPULSION_DISTANCE = 30
+const WALL_REPULSION_FORCE = 0.3
+
+// Corner colors for 2D gradient mapping
+// Top-left (slow, small), Top-right (fast, small), Bottom-left (slow, large), Bottom-right (fast, large)
+const CORNER_COLORS = [
+  { r: 0.2, g: 0.3, b: 0.8 },  // Top-left: Blue (slow, small)
+  { r: 0.8, g: 0.2, b: 0.3 },  // Top-right: Red (fast, small)
+  { r: 0.3, g: 0.8, b: 0.4 },  // Bottom-left: Green (slow, large)
+  { r: 0.9, g: 0.7, b: 0.2 },  // Bottom-right: Yellow (fast, large)
+]
 
 export default function VoronoiDiagrams() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -37,12 +52,18 @@ export default function VoronoiDiagrams() {
     const initSeeds = () => {
       seedsRef.current = Array.from({ length: SEED_COUNT }, () => {
         const angle = Math.random() * Math.PI * 2
+        const x = Math.random() * canvas.width
+        const y = Math.random() * canvas.height
         return {
-          x: Math.random() * canvas.width,
-          y: Math.random() * canvas.height,
+          x,
+          y,
           vx: Math.cos(angle) * SEED_SPEED,
           vy: Math.sin(angle) * SEED_SPEED,
           hue: Math.random() * 360,
+          prevX: x,
+          prevY: y,
+          speed: 0,
+          cellSize: 0,
         }
       })
     }
@@ -76,6 +97,33 @@ export default function VoronoiDiagrams() {
         seed.vx += repelX
         seed.vy += repelY
 
+        // Apply wall repulsion
+        const distToLeft = seed.x
+        const distToRight = canvas.width - seed.x
+        const distToTop = seed.y
+        const distToBottom = canvas.height - seed.y
+
+        // Repel from left wall
+        if (distToLeft < WALL_REPULSION_DISTANCE) {
+          const force = (WALL_REPULSION_DISTANCE - distToLeft) / WALL_REPULSION_DISTANCE * WALL_REPULSION_FORCE
+          seed.vx += force
+        }
+        // Repel from right wall
+        if (distToRight < WALL_REPULSION_DISTANCE) {
+          const force = (WALL_REPULSION_DISTANCE - distToRight) / WALL_REPULSION_DISTANCE * WALL_REPULSION_FORCE
+          seed.vx -= force
+        }
+        // Repel from top wall
+        if (distToTop < WALL_REPULSION_DISTANCE) {
+          const force = (WALL_REPULSION_DISTANCE - distToTop) / WALL_REPULSION_DISTANCE * WALL_REPULSION_FORCE
+          seed.vy += force
+        }
+        // Repel from bottom wall
+        if (distToBottom < WALL_REPULSION_DISTANCE) {
+          const force = (WALL_REPULSION_DISTANCE - distToBottom) / WALL_REPULSION_DISTANCE * WALL_REPULSION_FORCE
+          seed.vy -= force
+        }
+
         // Damping to prevent excessive speeds
         const speed = Math.sqrt(seed.vx * seed.vx + seed.vy * seed.vy)
         if (speed > SEED_SPEED * 2) {
@@ -85,6 +133,13 @@ export default function VoronoiDiagrams() {
 
         seed.x += seed.vx
         seed.y += seed.vy
+
+        // Calculate speed (distance traveled)
+        const dx = seed.x - seed.prevX
+        const dy = seed.y - seed.prevY
+        seed.speed = Math.sqrt(dx * dx + dy * dy)
+        seed.prevX = seed.x
+        seed.prevY = seed.y
 
         // Bounce off edges
         if (seed.x < 0 || seed.x > canvas.width) {
@@ -178,6 +233,44 @@ export default function VoronoiDiagrams() {
       return result
     }
 
+    // Calculate polygon area
+    const calculatePolygonArea = (polygon: [number, number][]): number => {
+      let area = 0
+      for (let i = 0; i < polygon.length; i++) {
+        const [x1, y1] = polygon[i]
+        const [x2, y2] = polygon[(i + 1) % polygon.length]
+        area += x1 * y2 - x2 * y1
+      }
+      return Math.abs(area) / 2
+    }
+
+    // Bilinear interpolation for 2D color mapping
+    const interpolateColor2D = (x: number, y: number) => {
+      // x = speed (0-1), y = size (0-1)
+      // Corners: [0] = top-left, [1] = top-right, [2] = bottom-left, [3] = bottom-right
+      const c00 = CORNER_COLORS[0] // top-left (slow, small)
+      const c10 = CORNER_COLORS[1] // top-right (fast, small)
+      const c01 = CORNER_COLORS[2] // bottom-left (slow, large)
+      const c11 = CORNER_COLORS[3] // bottom-right (fast, large)
+
+      // Interpolate along top edge
+      const topR = c00.r * (1 - x) + c10.r * x
+      const topG = c00.g * (1 - x) + c10.g * x
+      const topB = c00.b * (1 - x) + c10.b * x
+
+      // Interpolate along bottom edge
+      const bottomR = c01.r * (1 - x) + c11.r * x
+      const bottomG = c01.g * (1 - x) + c11.g * x
+      const bottomB = c01.b * (1 - x) + c11.b * x
+
+      // Interpolate between top and bottom
+      const r = Math.round((topR * (1 - y) + bottomR * y) * 255)
+      const g = Math.round((topG * (1 - y) + bottomG * y) * 255)
+      const b = Math.round((topB * (1 - y) + bottomB * y) * 255)
+
+      return `rgb(${r}, ${g}, ${b})`
+    }
+
     const drawVoronoi = () => {
       const width = canvas.width
       const height = canvas.height
@@ -187,20 +280,54 @@ export default function VoronoiDiagrams() {
       ctx.fillStyle = '#000000'
       ctx.fillRect(0, 0, width, height)
 
-      // Draw each Voronoi cell
+      // First pass: calculate cell sizes for all seeds
+      const cellData: { polygon: [number, number][]; area: number }[] = []
       seeds.forEach((seed, seedIdx) => {
         const polygon = computeVoronoiCell(seedIdx, seeds, width, height)
+        const area = polygon.length >= 3 ? calculatePolygonArea(polygon) : 0
+        cellData.push({ polygon, area })
+        seed.cellSize = area
+      })
+
+      // Find min/max for normalization
+      const speeds = seeds.map(s => s.speed)
+      const sizes = seeds.map(s => s.cellSize)
+      const minSpeed = Math.min(...speeds)
+      const maxSpeed = Math.max(...speeds)
+      const minSize = Math.min(...sizes)
+      const maxSize = Math.max(...sizes)
+
+      // Avoid division by zero
+      const speedRange = maxSpeed - minSpeed || 1
+      const sizeRange = maxSize - minSize || 1
+
+      // Draw each Voronoi cell with 2D color mapping
+      seeds.forEach((seed, seedIdx) => {
+        const { polygon } = cellData[seedIdx]
         
         if (polygon.length < 3) return
 
-        // Create radial gradient from seed point
+        // Normalize speed and size to 0-1
+        const normalizedSpeed = (seed.speed - minSpeed) / speedRange
+        const normalizedSize = (seed.cellSize - minSize) / sizeRange
+
+        // Get color based on 2D position
+        const baseColor = interpolateColor2D(normalizedSpeed, normalizedSize)
+
+        // Create radial gradient from seed point using the mapped color
         const maxDist = Math.sqrt(width * width + height * height)
         const gradient = ctx.createRadialGradient(seed.x, seed.y, 0, seed.x, seed.y, maxDist * 0.5)
-        gradient.addColorStop(0, `hsl(${seed.hue}, 100%, 85%)`)
-        gradient.addColorStop(0.2, `hsl(${seed.hue}, 95%, 65%)`)
-        gradient.addColorStop(0.5, `hsl(${seed.hue}, 80%, 45%)`)
-        gradient.addColorStop(0.8, `hsl(${seed.hue}, 65%, 25%)`)
-        gradient.addColorStop(1, `hsl(${seed.hue}, 50%, 10%)`)
+        
+        // Parse RGB from base color
+        const match = baseColor.match(/\d+/g)
+        if (match) {
+          const [r, g, b] = match.map(Number)
+          gradient.addColorStop(0, `rgb(${Math.min(255, r + 100)}, ${Math.min(255, g + 100)}, ${Math.min(255, b + 100)})`)
+          gradient.addColorStop(0.2, `rgb(${Math.min(255, r + 60)}, ${Math.min(255, g + 60)}, ${Math.min(255, b + 60)})`)
+          gradient.addColorStop(0.5, baseColor)
+          gradient.addColorStop(0.8, `rgb(${Math.round(r * 0.6)}, ${Math.round(g * 0.6)}, ${Math.round(b * 0.6)})`)
+          gradient.addColorStop(1, `rgb(${Math.round(r * 0.3)}, ${Math.round(g * 0.3)}, ${Math.round(b * 0.3)})`)
+        }
 
         // Draw polygon
         ctx.beginPath()

@@ -3,7 +3,7 @@ import { useEffect, useState, useRef } from 'react'
 // Configuration constants
 const CELL_SIZE = 10
 const BUFFER_CELLS = 10
-const PATTERN_SPAWN_INTERVAL = 12 // frames between pattern spawns
+const PATTERN_SPAWN_INTERVAL = 1 // frames between pattern spawns
 const CELL_COLOR_SATURATION = 70
 const CELL_COLOR_LIGHTNESS = 60
 
