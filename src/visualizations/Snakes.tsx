@@ -3,10 +3,12 @@ import { useEffect, useRef, useState } from 'react'
 // Configuration
 const SNAKE_COUNT = 5
 const SEGMENT_COUNT = 10
-const SEGMENT_RADIUS = 20
+const SEGMENT_RADIUS = 8
 const SNAKE_SPEED = 2
 const TURN_STRENGTH = 0.03 // radians per frame
 const TURN_DURATION_FRAMES = 60 // 1 second at 60fps
+const FOOD_COUNT = 100
+const FOOD_RADIUS = 5
 
 // Types
 interface Segment {
@@ -16,6 +18,12 @@ interface Segment {
   direction: number // angle in radians pointing "up" for this segment
 }
 
+interface Food {
+  x: number
+  y: number
+  radius: number
+}
+
 interface Snake {
   segments: Segment[]
   direction: number // angle in radians
@@ -23,6 +31,9 @@ interface Snake {
   turnDirection: number // -1, 0, or 1
   turnFramesRemaining: number
   color: { light: string; dark: string } // for gradient and outline
+  foodEaten: number
+  alive: boolean
+  opacity: number // for fade-out effect when dying
 }
 
 export default function Snakes() {
@@ -30,6 +41,8 @@ export default function Snakes() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const animationRef = useRef<number | undefined>(undefined)
   const snakesRef = useRef<Snake[]>([])
+  const foodRef = useRef<Food[]>([])
+  const animationTimeRef = useRef<number>(0)
 
   // Handle window resize
   useEffect(() => {
@@ -55,12 +68,32 @@ export default function Snakes() {
 
     // Initialize snakes
     if (snakesRef.current.length === 0) {
+      // Calculate buffer to keep snake bodies away from edges
+      const bodyLength = SEGMENT_COUNT * SEGMENT_RADIUS * 2
+      const buffer = bodyLength + SEGMENT_RADIUS
+      
+      // Divide canvas into grid regions for even distribution
+      const cols = Math.ceil(Math.sqrt(SNAKE_COUNT))
+      const rows = Math.ceil(SNAKE_COUNT / cols)
+      const cellWidth = size.width / cols
+      const cellHeight = size.height / rows
+      
       for (let snakeIndex = 0; snakeIndex < SNAKE_COUNT; snakeIndex++) {
         const segments: Segment[] = []
-        // Distribute snakes across the screen
-        const startX = (size.width / (SNAKE_COUNT + 1)) * (snakeIndex + 1)
-        const startY = size.height / 2
-        const startDirection = (Math.PI * 2 / SNAKE_COUNT) * snakeIndex
+        
+        // Determine which grid cell this snake belongs to
+        const col = snakeIndex % cols
+        const row = Math.floor(snakeIndex / cols)
+        
+        // Random position within the cell, respecting edge buffer
+        const cellMinX = col * cellWidth + buffer
+        const cellMaxX = (col + 1) * cellWidth - buffer
+        const cellMinY = row * cellHeight + buffer
+        const cellMaxY = (row + 1) * cellHeight - buffer
+        
+        const startX = cellMinX + Math.random() * Math.max(0, cellMaxX - cellMinX)
+        const startY = cellMinY + Math.random() * Math.max(0, cellMaxY - cellMinY)
+        const startDirection = Math.random() * Math.PI * 2
         
         // Create segments in a line based on starting direction
         for (let i = 0; i < SEGMENT_COUNT; i++) {
@@ -78,7 +111,21 @@ export default function Snakes() {
           speed: SNAKE_SPEED,
           turnDirection: 0,
           turnFramesRemaining: 0,
-          color: { light: '#66ff66', dark: '#228822' } // light green center, dark green outer
+          color: { light: '#66ff66', dark: '#228822' }, // light green center, dark green outer
+          foodEaten: 0,
+          alive: true,
+          opacity: 1
+        })
+      }
+    }
+
+    // Initialize food
+    if (foodRef.current.length === 0) {
+      for (let i = 0; i < FOOD_COUNT; i++) {
+        foodRef.current.push({
+          x: Math.random() * size.width,
+          y: Math.random() * size.height,
+          radius: FOOD_RADIUS
         })
       }
     }
@@ -92,8 +139,31 @@ export default function Snakes() {
       ctx.fillStyle = '#000000'
       ctx.fillRect(0, 0, size.width, size.height)
 
+      // Increment animation time for pulsation
+      animationTimeRef.current += 1
+
+      // Draw food with pulsating glow
+      const pulseScale = 1 + Math.sin(animationTimeRef.current * 0.1) * 0.105
+      for (const food of foodRef.current) {
+        const pulsatingRadius = food.radius * pulseScale
+        const gradient = ctx.createRadialGradient(
+          food.x, food.y, 0,
+          food.x, food.y, pulsatingRadius
+        )
+        gradient.addColorStop(0, '#ffff00')
+        gradient.addColorStop(0.4, '#ffdd00')
+        gradient.addColorStop(1, 'rgba(255, 221, 0, 0)')
+        
+        ctx.fillStyle = gradient
+        ctx.beginPath()
+        ctx.arc(food.x, food.y, pulsatingRadius, 0, Math.PI * 2)
+        ctx.fill()
+      }
+
       // Update and draw each snake
       for (const snake of snakes) {
+        if (!snake.alive) continue // Skip dead snakes
+
         // Update turn direction if needed
         if (snake.turnFramesRemaining <= 0) {
           // Choose new turn direction: -1 (left), 0 (straight), 1 (right)
@@ -106,8 +176,72 @@ export default function Snakes() {
         // Apply turn
         snake.direction += snake.turnDirection * TURN_STRENGTH
 
-        // Update head position
         const head = snake.segments[0]
+        
+        // DANGER AVOIDANCE: Only check what's directly ahead
+        let bestTurnDirection = 0
+        let minDanger = Infinity
+        
+        // Test three directions: left turn, straight, right turn
+        for (const testTurn of [-1, 0, 1]) {
+          const testAngle = snake.direction + testTurn * TURN_STRENGTH * 10
+          const testX = head.x + Math.cos(testAngle) * head.radius * 4
+          const testY = head.y + Math.sin(testAngle) * head.radius * 4
+          
+          let dangerScore = 0
+          
+          for (const otherSnake of snakes) {
+            if (!otherSnake.alive) continue
+            for (let i = 0; i < otherSnake.segments.length; i++) {
+              // Skip own first 4 segments
+              if (otherSnake === snake && i < 4) continue
+              
+              const seg = otherSnake.segments[i]
+              const dist = Math.sqrt((seg.x - testX) ** 2 + (seg.y - testY) ** 2)
+              
+              if (dist < head.radius * 2) {
+                dangerScore += 10
+              }
+            }
+          }
+          
+          if (dangerScore < minDanger) {
+            minDanger = dangerScore
+            bestTurnDirection = testTurn
+          }
+        }
+        
+        // Apply avoidance turn if danger detected
+        if (minDanger > 0) {
+          snake.direction += bestTurnDirection * TURN_STRENGTH * 8
+        }
+        
+        // FOOD CHASING: Find closest food within detection radius
+        const detectionRadius = head.radius * 15
+        let closestFood: Food | null = null
+        let closestDist = Infinity
+        
+        for (const food of foodRef.current) {
+          const dist = Math.sqrt((food.x - head.x) ** 2 + (food.y - head.y) ** 2)
+          if (dist < detectionRadius && dist < closestDist) {
+            closestFood = food
+            closestDist = dist
+          }
+        }
+        
+        // Turn toward food (when safe)
+        if (closestFood && minDanger === 0) {
+          const angleToFood = Math.atan2(closestFood.y - head.y, closestFood.x - head.x)
+          let diff = angleToFood - snake.direction
+          while (diff > Math.PI) diff -= Math.PI * 2
+          while (diff < -Math.PI) diff += Math.PI * 2
+          
+          if (Math.abs(diff) > 0.01) {
+            snake.direction += Math.sign(diff) * TURN_STRENGTH * 1.5
+          }
+        }
+
+        // Update head position
         head.x += Math.cos(snake.direction) * snake.speed
         head.direction = snake.direction
         head.y += Math.sin(snake.direction) * snake.speed
@@ -115,6 +249,109 @@ export default function Snakes() {
         // Wrap head around screen edges using modulo
         head.x = ((head.x % size.width) + size.width) % size.width
         head.y = ((head.y % size.height) + size.height) % size.height
+
+        // Check for food collision
+        for (let i = foodRef.current.length - 1; i >= 0; i--) {
+          const food = foodRef.current[i]
+          const dist = Math.sqrt((food.x - head.x) ** 2 + (food.y - head.y) ** 2)
+          
+          if (dist < head.radius + food.radius) {
+            foodRef.current.splice(i, 1)
+            snake.foodEaten++
+            
+            // Grow segment every 5 food
+            if (snake.foodEaten % 5 === 0) {
+              const tail = snake.segments[snake.segments.length - 1]
+              const prevTail = snake.segments[snake.segments.length - 2]
+              
+              let dx = tail.x - prevTail.x
+              let dy = tail.y - prevTail.y
+              if (Math.abs(dx) > size.width / 2) dx = dx > 0 ? dx - size.width : dx + size.width
+              if (Math.abs(dy) > size.height / 2) dy = dy > 0 ? dy - size.height : dy + size.height
+              const angle = Math.atan2(dy, dx)
+              
+              snake.segments.push({
+                x: tail.x + Math.cos(angle) * tail.radius,
+                y: tail.y + Math.sin(angle) * tail.radius,
+                radius: tail.radius,
+                direction: angle + Math.PI
+              })
+            }
+            
+            // Grow radius every 30 food
+            if (snake.foodEaten % 30 === 0) {
+              for (const seg of snake.segments) {
+                seg.radius += 1
+              }
+            }
+            
+            // Only spawn replacement food if we have less than 100
+            if (foodRef.current.length < FOOD_COUNT) {
+              foodRef.current.push({
+                x: Math.random() * size.width,
+                y: Math.random() * size.height,
+                radius: FOOD_RADIUS
+              })
+            }
+            break
+          }
+        }
+        
+        // Check for collisions with OTHER snakes
+        for (const otherSnake of snakes) {
+          if (!otherSnake.alive || otherSnake === snake) continue // Skip self and dead snakes
+          
+          // Check for HEAD-TO-HEAD collision first (both die)
+          const otherHead = otherSnake.segments[0]
+          const headToHeadDist = Math.sqrt((otherHead.x - head.x) ** 2 + (otherHead.y - head.y) ** 2)
+          if (headToHeadDist < head.radius + otherHead.radius - 2) {
+            // Both snakes die in head-to-head collision
+            snake.alive = false
+            snake.opacity = 1 // Start fading
+            otherSnake.alive = false
+            otherSnake.opacity = 1 // Start fading
+            
+            // Spawn food from both bodies
+            for (const deadSnake of [snake, otherSnake]) {
+              const foodToSpawn = Math.floor(deadSnake.foodEaten / 2)
+              for (let f = 0; f < foodToSpawn; f++) {
+                const randomSeg = deadSnake.segments[Math.floor(Math.random() * deadSnake.segments.length)]
+                foodRef.current.push({
+                  x: randomSeg.x + (Math.random() - 0.5) * 20,
+                  y: randomSeg.y + (Math.random() - 0.5) * 20,
+                  radius: FOOD_RADIUS
+                })
+              }
+            }
+            break
+          }
+          
+          // Check collision with other snake's body segments
+          for (let i = 0; i < otherSnake.segments.length; i++) {
+            const seg = otherSnake.segments[i]
+            const dist = Math.sqrt((seg.x - head.x) ** 2 + (seg.y - head.y) ** 2)
+            
+            if (dist < head.radius + seg.radius - 2) {
+              // DIE
+              snake.alive = false
+              snake.opacity = 1 // Start fading
+              
+              // Spawn food from body
+              const foodToSpawn = Math.floor(snake.foodEaten / 2)
+              for (let f = 0; f < foodToSpawn; f++) {
+                const randomSeg = snake.segments[Math.floor(Math.random() * snake.segments.length)]
+                foodRef.current.push({
+                  x: randomSeg.x + (Math.random() - 0.5) * 20,
+                  y: randomSeg.y + (Math.random() - 0.5) * 20,
+                  radius: FOOD_RADIUS
+                })
+              }
+              break
+            }
+          }
+          
+          if (!snake.alive) break
+        }
 
         // Update each segment to follow the one before it
         for (let i = 1; i < snake.segments.length; i++) {
@@ -147,6 +384,7 @@ export default function Snakes() {
         }
 
         // Draw filled circles with radial gradient (from last to first)
+        ctx.globalAlpha = snake.opacity // Apply fade-out opacity
         for (let i = snake.segments.length - 1; i >= 0; i--) {
           const segment = snake.segments[i]
           
@@ -282,6 +520,24 @@ export default function Snakes() {
         
         ctx.stroke()
         
+        // Draw detection radius circle (reuse already calculated detectionRadius from above)
+        ctx.strokeStyle = 'rgba(128, 128, 128, 0.3)'
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.arc(head.x, head.y, head.radius * 15, 0, Math.PI * 2)
+        ctx.stroke()
+
+        // Draw food counter
+        ctx.fillStyle = '#ffffff'
+        ctx.font = 'bold 16px monospace'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(
+          snake.foodEaten.toString(),
+          head.x,
+          head.y - head.radius - 15
+        )
+        
         // Draw eyes on the head segment (head already declared above)
         const eyeRadius = snake.segments[0].radius * 0.15
         const forwardOffset = snake.segments[0].radius * 0.4 // position towards front
@@ -303,6 +559,48 @@ export default function Snakes() {
         ctx.beginPath()
         ctx.arc(rightEyeX, rightEyeY, eyeRadius, 0, Math.PI * 2)
         ctx.fill()
+        
+        // Reset global alpha
+        ctx.globalAlpha = 1
+      }
+      
+      // FADE OUT and RESPAWN dead snakes
+      for (let i = 0; i < snakes.length; i++) {
+        if (!snakes[i].alive) {
+          // Fade out gradually
+          snakes[i].opacity -= 0.02
+          
+          // Only respawn when fully faded
+          if (snakes[i].opacity <= 0) {
+            const segments: Segment[] = []
+            const startX = Math.random() * size.width
+            const startY = Math.random() * size.height
+            const startDirection = Math.random() * Math.PI * 2
+            
+            // Create segments in a line
+            for (let j = 0; j < SEGMENT_COUNT; j++) {
+              segments.push({
+                x: startX - Math.cos(startDirection) * j * (SEGMENT_RADIUS * 2),
+                y: startY - Math.sin(startDirection) * j * (SEGMENT_RADIUS * 2),
+                radius: SEGMENT_RADIUS,
+                direction: startDirection
+              })
+            }
+            
+            // Replace the dead snake
+            snakes[i] = {
+              segments,
+              direction: startDirection,
+              speed: SNAKE_SPEED,
+              turnDirection: 0,
+              turnFramesRemaining: 0,
+              color: { light: '#66ff66', dark: '#228822' },
+              foodEaten: 0,
+              alive: true,
+              opacity: 1
+            }
+          }
+        }
       }
       
       animationRef.current = requestAnimationFrame(animate)
