@@ -22,6 +22,7 @@ interface Snake {
   speed: number
   turnDirection: number // -1, 0, or 1
   turnFramesRemaining: number
+  color: { light: string; dark: string } // for gradient and outline
 }
 
 export default function Snakes() {
@@ -76,7 +77,8 @@ export default function Snakes() {
           direction: startDirection,
           speed: SNAKE_SPEED,
           turnDirection: 0,
-          turnFramesRemaining: 0
+          turnFramesRemaining: 0,
+          color: { light: '#66ff66', dark: '#228822' } // light green center, dark green outer
         })
       }
     }
@@ -144,9 +146,28 @@ export default function Snakes() {
           current.y = ((current.y % size.height) + size.height) % size.height
         }
 
+        // Draw filled circles with radial gradient (from last to first)
+        for (let i = snake.segments.length - 1; i >= 0; i--) {
+          const segment = snake.segments[i]
+          
+          // Create radial gradient
+          const gradient = ctx.createRadialGradient(
+            segment.x, segment.y, 0,
+            segment.x, segment.y, segment.radius
+          )
+          gradient.addColorStop(0, snake.color.light) // light green in center
+          gradient.addColorStop(1, snake.color.dark)  // dark green on outer edge
+          
+          // Draw filled circle
+          ctx.fillStyle = gradient
+          ctx.beginPath()
+          ctx.arc(segment.x, segment.y, segment.radius, 0, Math.PI * 2)
+          ctx.fill()
+        }
+
         // Draw snake outline by connecting dots continuously
-        ctx.strokeStyle = '#ff0000'
-        ctx.lineWidth = 2
+        ctx.strokeStyle = snake.color.light // outline matches light center color
+        ctx.lineWidth = 1
         ctx.beginPath()
         
         let lastX: number | null = null
@@ -260,6 +281,28 @@ export default function Snakes() {
         }
         
         ctx.stroke()
+        
+        // Draw eyes on the head segment (head already declared above)
+        const eyeRadius = snake.segments[0].radius * 0.15
+        const forwardOffset = snake.segments[0].radius * 0.4 // position towards front
+        const lateralOffset = snake.segments[0].radius * 0.35 // spacing from center line
+        
+        // Calculate eye positions
+        const leftEyeX = snake.segments[0].x + Math.cos(snake.direction) * forwardOffset + Math.cos(snake.direction + Math.PI / 2) * lateralOffset
+        const leftEyeY = snake.segments[0].y + Math.sin(snake.direction) * forwardOffset + Math.sin(snake.direction + Math.PI / 2) * lateralOffset
+        const rightEyeX = snake.segments[0].x + Math.cos(snake.direction) * forwardOffset + Math.cos(snake.direction - Math.PI / 2) * lateralOffset
+        const rightEyeY = snake.segments[0].y + Math.sin(snake.direction) * forwardOffset + Math.sin(snake.direction - Math.PI / 2) * lateralOffset
+        
+        // Draw left eye (red - opposite hue from green)
+        ctx.fillStyle = '#ff0000'
+        ctx.beginPath()
+        ctx.arc(leftEyeX, leftEyeY, eyeRadius, 0, Math.PI * 2)
+        ctx.fill()
+        
+        // Draw right eye
+        ctx.beginPath()
+        ctx.arc(rightEyeX, rightEyeY, eyeRadius, 0, Math.PI * 2)
+        ctx.fill()
       }
       
       animationRef.current = requestAnimationFrame(animate)
