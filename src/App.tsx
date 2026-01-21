@@ -5,6 +5,7 @@ import ParticleFlowField from './visualizations/ParticleFlowField'
 import FlockingBoids from './visualizations/FlockingBoids'
 import ConwayGameOfLife from './visualizations/ConwayGameOfLife'
 import VoronoiDiagrams from './visualizations/VoronoiDiagrams'
+import CircularVoronoi from './visualizations/CircularVoronoi'
 import OrbitingLights from './visualizations/OrbitingLights'
 // import Snakes from './visualizations/Snakes'
 
@@ -13,7 +14,8 @@ const VISUALIZATIONS = [
   { id: 'flow-field', name: 'Particle Flow Field', component: ParticleFlowField },
   { id: 'flocking-boids', name: 'Flocking Boids', component: FlockingBoids },
   { id: 'game-of-life', name: "Game of Life", component: ConwayGameOfLife },
-  { id: 'voronoi', name: 'Voronoi Diagrams', component: VoronoiDiagrams },
+  { id: 'voronoi', name: 'Voronoi Diagram', component: VoronoiDiagrams },
+  { id: 'circular-voronoi', name: 'Circular Voronoi', component: CircularVoronoi },
   { id: 'orbiting-lights', name: 'Orbiting Lights', component: OrbitingLights },
   // { id: 'snakes', name: 'Snakes', component: Snakes },
 ]
