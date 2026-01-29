@@ -12,7 +12,7 @@ interface Point {
   cellSize: number
 }
 
-const SEED_COUNT = 250
+const SEED_COUNT = 300
 const SEED_SPEED = 1.5
 const REPULSION_FORCE = 0.5
 const MIN_DISTANCE = 50
