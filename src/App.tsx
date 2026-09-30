@@ -7,6 +7,7 @@ import ConwayGameOfLife from './visualizations/ConwayGameOfLife'
 import VoronoiDiagrams from './visualizations/VoronoiDiagrams'
 import CircularVoronoi from './visualizations/CircularVoronoi'
 import OrbitingLights from './visualizations/OrbitingLights'
+import SphereField from './visualizations/SphereField'
 // import Snakes from './visualizations/Snakes'
 
 const VISUALIZATIONS = [
@@ -17,6 +18,7 @@ const VISUALIZATIONS = [
   { id: 'voronoi', name: 'Voronoi Diagram', component: VoronoiDiagrams },
   { id: 'circular-voronoi', name: 'Circular Voronoi', component: CircularVoronoi },
   { id: 'orbiting-lights', name: 'Orbiting Lights', component: OrbitingLights },
+  { id: 'sphere-field', name: 'Sphere Field', component: SphereField },
   // { id: 'snakes', name: 'Snakes', component: Snakes },
 ]
 
