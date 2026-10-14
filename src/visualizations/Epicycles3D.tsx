@@ -5,12 +5,13 @@ import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js'
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js'
 
 // Configuration constants
-const ANIMATION_DURATION_SECONDS = 60
+const ANIMATION_DURATION_SECONDS = 120
 const PAUSE_DURATION_SECONDS = 30
-const SAMPLES = 4000 // trace points per full cycle
-const MIN_ROTATIONS = 3
-const MAX_ROTATIONS = 24
+const SAMPLES = 40000 // trace points per full cycle
+const MIN_ROTATIONS = 30 // per arm, per full cycle
+const MAX_ROTATIONS = 240
 const MIN_AXIS_ANGLE_DEG = 35 // keep the two spin axes apart so the curve is never flat
+const MIN_HUE_SEPARATION = 1 / 3 // inner vs outer trace hue, as a fraction of the wheel
 const TRACE_WIDTH = 2.5
 const ARM_WIDTH = 2
 const CAMERA_ORBIT_SECONDS = 12 // one full turn around the shape
@@ -132,29 +133,36 @@ export default function Epicycles3D() {
         tip.toArray(positions, i * 3)
       }
 
-      // Color each point by local tip speed, slow hue -> fast hue (as in the 2D version)
-      const speeds = new Float32Array(SAMPLES + 1)
-      for (let i = 0; i < SAMPLES; i++) {
-        const dx = positions[i * 3 + 3] - positions[i * 3]
-        const dy = positions[i * 3 + 4] - positions[i * 3 + 1]
-        const dz = positions[i * 3 + 5] - positions[i * 3 + 2]
-        speeds[i + 1] = Math.sqrt(dx * dx + dy * dy + dz * dz)
-      }
-      speeds[0] = speeds[SAMPLES]
-      let minSpeed = Infinity
-      let maxSpeed = 0
-      for (const s of speeds) {
-        minSpeed = Math.min(minSpeed, s)
-        maxSpeed = Math.max(maxSpeed, s)
+      // Color each point by its distance from the center: the curve's nearest point gets the
+      // inner color, its farthest point the outer color, everything else in between
+      const distances = new Float32Array(SAMPLES + 1)
+      let minDistance = Infinity
+      let maxDistance = 0
+      for (let i = 0; i <= SAMPLES; i++) {
+        const d = Math.hypot(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2])
+        distances[i] = d
+        minDistance = Math.min(minDistance, d)
+        maxDistance = Math.max(maxDistance, d)
       }
 
-      const slow = new THREE.Color().setHSL(...randomHsl())
-      const fast = new THREE.Color().setHSL(...randomHsl())
+      // Inner and outer hues at least MIN_HUE_SEPARATION apart; blend along the hue wheel
+      // (not through RGB, which greys out between distant hues)
+      const [innerHue, innerSat, innerLight] = randomHsl()
+      const [, outerSat, outerLight] = randomHsl()
+      const hueShift = MIN_HUE_SEPARATION + Math.random() * (0.5 - MIN_HUE_SEPARATION)
+      const outerHue = innerHue + (Math.random() < 0.5 ? hueShift : -hueShift)
       const color = new THREE.Color()
       const colors = new Float32Array((SAMPLES + 1) * 3)
       for (let i = 0; i <= SAMPLES; i++) {
-        const ratio = maxSpeed > minSpeed ? (speeds[i] - minSpeed) / (maxSpeed - minSpeed) : 0
-        color.lerpColors(slow, fast, ratio).toArray(colors, i * 3)
+        const ratio = maxDistance > minDistance ? (distances[i] - minDistance) / (maxDistance - minDistance) : 0
+        const hue = (((innerHue + (outerHue - innerHue) * ratio) % 1) + 1) % 1
+        color
+          .setHSL(
+            hue,
+            innerSat + (outerSat - innerSat) * ratio,
+            innerLight + (outerLight - innerLight) * ratio,
+          )
+          .toArray(colors, i * 3)
       }
 
       // A fresh geometry per shape; disposing the old one frees its GPU buffers
