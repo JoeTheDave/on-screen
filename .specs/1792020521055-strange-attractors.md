@@ -21,3 +21,12 @@ visibly collapses/unfurls onto the new attractor. The camera orbits throughout.
   vertex colors from a per-attractor two-hue palette by speed.
 - Camera orbits (20 s/turn) with a slow elevation swing.
 - Register in `App.tsx` as "Strange Attractors".
+
+## Shipped — Iteration 1
+
+- Commit: 5747f57 (master)
+- Deploy: `flyctl deploy --remote-only` succeeded; live bundle verified to contain `strange-attractors`.
+- Tests: no suite in this project. Ran two headless node checks of `attractors.ts` (bundled with
+  esbuild): warm-up stats finite for all four systems; every attractor→attractor transition
+  converges (0–1 % escapes, Aizawa→Halvorsen 10.7 % which respawn). `npm run build` + eslint clean.
+- DB backup: n/a — frontend-only.
