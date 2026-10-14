@@ -29,7 +29,7 @@ deployments:
 | Layer | In Use |
 |-------|--------|
 | Frontend | React 19, TypeScript, Tailwind CSS v4, Vite |
-| 3D / Canvas | Three.js (OrbitingLights), HTML Canvas 2D (all other visualizations) |
+| 3D / Canvas | Three.js (OrbitingLights, 3D Epicycles — fat lines via `three/examples/jsm/lines`), HTML Canvas 2D (all other visualizations) |
 | Backend | None |
 | Database | None |
 | Auth | None (public URL, no login) |
@@ -50,7 +50,9 @@ on-screen/
 │   │   ├── ConwayGameOfLife.tsx
 │   │   ├── VoronoiDiagrams.tsx
 │   │   ├── CircularVoronoi.tsx
+│   │   ├── Epicycles3D.tsx     # Three.js
 │   │   ├── OrbitingLights.tsx  # Three.js; others use Canvas 2D
+│   │   ├── SphereField.tsx
 │   │   └── Snakes.tsx          # Shelved — commented out in App.tsx
 │   ├── App.tsx                 # Root: visualization router + hidden menu button
 │   ├── main.tsx                # Entry point — Screen Wake Lock setup lives here
@@ -64,6 +66,29 @@ on-screen/
 ├── CLAUDE.md
 └── .specs/
 ```
+
+## Visualization Notes
+
+### 3D Epicycles (`Epicycles3D.tsx`)
+The 3D take on Fourier Epicycles. Two arms chain from the origin; each spins about its own random
+3D axis (axes kept ≥ 35° apart so the curve never collapses flat). Arm lengths split 20–50 % /
+50–80 % of a unit radius. Each arm makes 30–240 turns per cycle, with coprime counts so the tip
+traces one closed space curve that only completes at the end of the cycle.
+- **Cycle:** 120 s draw, then the arms hide and the finished shape holds for 30 s, then a new shape.
+- **Trace:** the whole curve (40,000 samples) is precomputed per shape into a `Line2` fat-line
+  geometry; drawing reveals it by raising `instanceCount`. The geometry is disposed and recreated
+  per shape and the arm buffer is updated in place — both to avoid leaking GPU buffers on an
+  always-on screen.
+- **Color:** by distance from the center — the curve's nearest point gets the inner hue, its
+  farthest the outer hue (≥ 120° apart), blended around the hue wheel rather than through RGB.
+- **Camera:** orbits once every 12 s with a 17 s elevation swing (±0.5 rad), auto-fit to the
+  aspect ratio; distance fog dims the far side for depth.
+- A three-arm variant was tried and reverted — it produced chaotic shapes, as in 2D.
+
+### Sphere Field (`SphereField.tsx`)
+A uniform dot grid with 7 invisible drifting "spheres". Each dot's size and color come from the
+hemisphere height `sqrt(1 - (d/R)^2)` of the spheres over it, combined as `1 - Π(1 - h)`; the
+spheres show only as swelling, tinted patches. Untouched dots are batched into one path.
 
 ## Screen Wake Lock
 
@@ -88,4 +113,5 @@ None. This is a fully static app with no runtime environment.
 
 ## Tagged Versions
 
+- v1.0.0 (2026-10-14) — First semver tag: adds Sphere Field and 3D Epicycles visualizations
 - Initial release — 2026-01 — Static site with wake lock + 7 visualizations deployed to Fly.io
