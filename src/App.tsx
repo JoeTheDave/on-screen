@@ -9,6 +9,7 @@ import CircularVoronoi from './visualizations/CircularVoronoi'
 import OrbitingLights from './visualizations/OrbitingLights'
 import SphereField from './visualizations/SphereField'
 import Epicycles3D from './visualizations/Epicycles3D'
+import WaveGrid from './visualizations/WaveGrid'
 // import Snakes from './visualizations/Snakes'
 
 const VISUALIZATIONS = [
@@ -21,6 +22,7 @@ const VISUALIZATIONS = [
   { id: 'circular-voronoi', name: 'Circular Voronoi', component: CircularVoronoi },
   { id: 'orbiting-lights', name: 'Orbiting Lights', component: OrbitingLights },
   { id: 'sphere-field', name: 'Sphere Field', component: SphereField },
+  { id: 'wave-grid', name: 'Wave Grid', component: WaveGrid },
   // { id: 'snakes', name: 'Snakes', component: Snakes },
 ]
 
