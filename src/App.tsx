@@ -11,6 +11,16 @@ import SphereField from './visualizations/SphereField'
 import Epicycles3D from './visualizations/Epicycles3D'
 import WaveGrid from './visualizations/WaveGrid'
 import StrangeAttractors from './visualizations/StrangeAttractors'
+import ReactionDiffusion from './visualizations/ReactionDiffusion'
+import Aurora from './visualizations/Aurora'
+import SlimeMold from './visualizations/SlimeMold'
+import Mandelbulb from './visualizations/Mandelbulb'
+import GalaxyCollision from './visualizations/GalaxyCollision'
+import InkFluid from './visualizations/InkFluid'
+import BlackHole from './visualizations/BlackHole'
+import Hypercube from './visualizations/Hypercube'
+import Cymatics from './visualizations/Cymatics'
+import TerrainFlight from './visualizations/TerrainFlight'
 // import Snakes from './visualizations/Snakes'
 
 const VISUALIZATIONS = [
@@ -25,6 +35,16 @@ const VISUALIZATIONS = [
   { id: 'sphere-field', name: 'Sphere Field', component: SphereField },
   { id: 'wave-grid', name: 'Wave Grid', component: WaveGrid },
   { id: 'strange-attractors', name: 'Strange Attractors', component: StrangeAttractors },
+  { id: 'reaction-diffusion', name: 'Reaction Diffusion', component: ReactionDiffusion },
+  { id: 'aurora', name: 'Aurora', component: Aurora },
+  { id: 'slime-mold', name: 'Slime Mold', component: SlimeMold },
+  { id: 'mandelbulb', name: 'Mandelbulb', component: Mandelbulb },
+  { id: 'galaxy-collision', name: 'Galaxy Collision', component: GalaxyCollision },
+  { id: 'ink-fluid', name: 'Ink in Water', component: InkFluid },
+  { id: 'black-hole', name: 'Black Hole', component: BlackHole },
+  { id: 'hypercube', name: 'Hypercube', component: Hypercube },
+  { id: 'cymatics', name: 'Cymatics', component: Cymatics },
+  { id: 'terrain-flight', name: 'Terrain Flight', component: TerrainFlight },
   // { id: 'snakes', name: 'Snakes', component: Snakes },
 ]
 
