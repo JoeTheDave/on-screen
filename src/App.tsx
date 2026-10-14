@@ -10,6 +10,7 @@ import OrbitingLights from './visualizations/OrbitingLights'
 import SphereField from './visualizations/SphereField'
 import Epicycles3D from './visualizations/Epicycles3D'
 import WaveGrid from './visualizations/WaveGrid'
+import StrangeAttractors from './visualizations/StrangeAttractors'
 // import Snakes from './visualizations/Snakes'
 
 const VISUALIZATIONS = [
@@ -23,6 +24,7 @@ const VISUALIZATIONS = [
   { id: 'orbiting-lights', name: 'Orbiting Lights', component: OrbitingLights },
   { id: 'sphere-field', name: 'Sphere Field', component: SphereField },
   { id: 'wave-grid', name: 'Wave Grid', component: WaveGrid },
+  { id: 'strange-attractors', name: 'Strange Attractors', component: StrangeAttractors },
   // { id: 'snakes', name: 'Snakes', component: Snakes },
 ]
 
