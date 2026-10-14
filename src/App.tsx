@@ -8,10 +8,12 @@ import VoronoiDiagrams from './visualizations/VoronoiDiagrams'
 import CircularVoronoi from './visualizations/CircularVoronoi'
 import OrbitingLights from './visualizations/OrbitingLights'
 import SphereField from './visualizations/SphereField'
+import Epicycles3D from './visualizations/Epicycles3D'
 // import Snakes from './visualizations/Snakes'
 
 const VISUALIZATIONS = [
   { id: 'fourier', name: 'Fourier Epicycles', component: FourierEpicycles },
+  { id: 'epicycles-3d', name: '3D Epicycles', component: Epicycles3D },
   { id: 'flow-field', name: 'Particle Flow Field', component: ParticleFlowField },
   { id: 'flocking-boids', name: 'Flocking Boids', component: FlockingBoids },
   { id: 'game-of-life', name: "Game of Life", component: ConwayGameOfLife },
