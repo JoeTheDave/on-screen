@@ -6,15 +6,15 @@ import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js'
 
 // Configuration constants
 const ANIMATION_DURATION_SECONDS = 60
-const PAUSE_DURATION_SECONDS = 10
+const PAUSE_DURATION_SECONDS = 30
 const SAMPLES = 4000 // trace points per full cycle
 const MIN_ROTATIONS = 3
 const MAX_ROTATIONS = 24
 const MIN_AXIS_ANGLE_DEG = 35 // keep the two spin axes apart so the curve is never flat
 const TRACE_WIDTH = 2.5
 const ARM_WIDTH = 2
-const CAMERA_ORBIT_SECONDS = 45 // one full turn around the shape
-const CAMERA_BOB_SECONDS = 27 // one full elevation swing
+const CAMERA_ORBIT_SECONDS = 12 // one full turn around the shape
+const CAMERA_BOB_SECONDS = 17 // one full elevation swing
 const CAMERA_BOB_RADIANS = 0.5
 
 const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b))
