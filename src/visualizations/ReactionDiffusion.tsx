@@ -1,54 +1,39 @@
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
 import {
-  FLOW_BANDS,
-  FRONT_BANDS,
+  BLEACH_KILL,
+  ORIGINS,
+  REGIMES,
+  SEED_BAND,
+  SEED_CELL,
+  SEED_GAP,
+  SEED_RADIUS,
+  WOBBLES,
   coverage,
-  createVortex,
-  createWaveField,
-  updateFlow,
-  updateFronts,
-  updateVortex,
+  frontRadius,
+  measureFront,
+  phaseSeconds,
+  planCycle,
+  startPhase,
+  type Phase,
 } from './reactionDiffusionMath'
 
-// Configuration constants
+// Configuration constants (phase timing, regimes and transitions live in reactionDiffusionMath)
 const SIM_LONG_SIDE = 512 // sim grid texels along the screen's long axis
-const STEPS_PER_SECOND = 960 // Gray-Scott steps (dt = 1) per real second
+const STEPS_PER_SECOND = 960 // Gray-Scott steps (dt = 1) per sim-second; phases run on sim time
 const MAX_STEPS_PER_FRAME = 24 // cap so a slow frame can't snowball into slower frames
-const CYCLE_SECONDS = 60 // new regime + palette + fresh drops
-const SPRINKLE_SECONDS = 20 // a few extra drops in between, so nothing ever settles
-const REGIME_BLEND_SECONDS = 25 // feed/kill glide from one regime to the next
-const PALETTE_BLEND_SECONDS = 10
 const MAX_DROPS = 24 // must match the size of uDrops (passed as a #define)
 const INITIAL_DROPS = 22
-const CYCLE_DROPS = 10
-const SPRINKLE_DROPS = 4
-const FLOW_SPEED = 1 // scales the stirring flow (crest speeds live in reactionDiffusionMath)
-const FLOW_WAVES = FLOW_BANDS.length // sizes of the shader's uniform arrays (#defines)
-const FRONT_WAVES = FRONT_BANDS.length
+const RESCUE_DROPS = 10
 const PROBE_SIZE = 32 // coverage probe grid, read back now and then to catch a dead/solid field
 const PROBE_SECONDS = 3
+const GUARD_GRACE_SECONDS = 10 // a fresh spread starts below DEAD_COVERAGE; let it grow first
 const DEAD_COVERAGE = 0.03 // below this share of B, re-seed
-const SOLID_COVERAGE = 0.9 // above it, punch holes
+const SOLID_COVERAGE = 0.985 // above it, punch holes (the holes regime itself reads up to ~0.92)
+const GLOW_FADE_SECONDS = 1.5 // the front's bright edge fades in as it appears
 const BUMP = 3.2 // height-gradient -> normal steepness
 const LIGHT_SECONDS_X = 57
 const LIGHT_SECONDS_Y = 83
-
-// Well-known Gray-Scott regimes (feed, kill) — Pearson / Sims / Munafo naming
-const REGIMES: [number, number][] = [
-  [0.0545, 0.062], // coral
-  [0.0367, 0.0649], // mitosis: spots that grow and split
-  [0.029, 0.057], // labyrinth / fingerprints
-  [0.078, 0.061], // worms
-  [0.03, 0.062], // solitons: stable spots
-  [0.039, 0.058], // holes / negative spots
-]
-
-// Regime pairs whose in-between (F, k) fills solid with B, so they never share the screen or
-// glide straight into each other
-const CLASHING_PAIRS = ['2-3', '3-5'] // labyrinth/worms, worms/holes
-const clashes = (i: number, j: number) =>
-  i === j || CLASHING_PAIRS.includes(`${Math.min(i, j)}-${Math.max(i, j)}`)
 
 // [deep valley, mid body, raised peak, specular tint] — sRGB hex
 const PALETTES: [number, number, number, number][] = [
@@ -62,6 +47,8 @@ const PALETTES: [number, number, number, number][] = [
   [0x100a02, 0x6b5a12, 0xe8f0a0, 0xffffe8], // olive lacquer
 ]
 
+const glslFloat = (x: number) => x.toFixed(4)
+
 const vertexShader = /* glsl */ `
 varying vec2 vUv;
 void main() {
@@ -70,29 +57,65 @@ void main() {
 }
 `
 
-// One advected Gray-Scott step. The red channel stores (1 - A) rather than A: A sits near 1
-// almost everywhere, where half-float spacing is ~0.0005 — coarser than the per-step changes.
-// Near 0 half floats are very precise, so storing the complement keeps the reaction from stalling.
+// The advancing front, shared by the sim and display passes (and mirrored by frontDistance in
+// reactionDiffusionMath): texel distance to the nearest origin, wrapped because the sim tiles,
+// plus a few integer-wavenumber ripples so the edge is organic rather than a perfect circle.
+// An origin with weights (0, 1) or (1, 0) is a line, and its front is a pair of parallel bands.
+const frontChunk = /* glsl */ `
+uniform vec2 uSimSize;
+uniform vec4 uOrigins[ORIGINS]; // u, v, weight x, weight y
+uniform vec4 uWobble[WOBBLES]; // kx, ky (integer, per uv), phase, amplitude (texels)
+
+float frontDistance(vec2 uv) {
+  float d = 1e6;
+  for (int i = 0; i < ORIGINS; i++) {
+    vec2 o = uv - uOrigins[i].xy;
+    o -= floor(o + 0.5);
+    d = min(d, length(o * uSimSize * uOrigins[i].zw));
+  }
+  for (int i = 0; i < WOBBLES; i++) {
+    vec4 w = uWobble[i];
+    d += w.w * sin(6.2831853 * dot(w.xy, uv) + w.z);
+  }
+  return d;
+}
+`
+
+// One Gray-Scott step. The red channel stores (1 - A) rather than A: A sits near 1 almost
+// everywhere, where half-float spacing is ~0.0005 — coarser than the per-step changes. Near 0
+// half floats are very precise, so storing the complement keeps the reaction from stalling.
 //
-// First the field is carried along a slow, divergence-free flow (semi-Lagrangian: read the state
-// at uv - vel). The displacement is under a texel, so the bilinear lookup is done by hand from the
-// 3x3 neighbourhood already fetched for the Laplacian — full float precision, no extra fetches,
-// and none of the 8-bit weight quantization of hardware filtering that would freeze slow regions.
-// Then feed/kill come from two regimes blended by broad traveling fronts, so as a front rolls past,
-// one kind of pattern converts into the other.
+// Feed/kill come from the new regime behind the front and the old one ahead of it. Optionally a
+// band just behind the front bleaches B away, and behind that nuclei (fixed, hashed discs) are
+// planted so the new regime has something to grow from where the old pattern dissolves.
 const simFragmentShader = /* glsl */ `
 uniform sampler2D uState;
 uniform vec2 uTexel;
-uniform vec2 uSimSize;
-uniform vec2 uFeedKillA;
-uniform vec2 uFeedKillB;
-uniform vec4 uFlowWaves[FLOW_WAVES]; // kx, ky (integer, per uv), phase, unused
-uniform vec2 uFlowVel[FLOW_WAVES]; // velocity at the crest, texels/step
-uniform vec4 uFronts[FRONT_WAVES]; // kx, ky, phase, weight (weights sum to 1)
-uniform vec4 uVortex; // center (uv), radius (texels), spin
+uniform vec2 uFeedKillOld;
+uniform vec2 uFeedKillNew;
+uniform vec4 uFront; // radius (texels), bleach width (texels), seed density, seed salt
 varying vec2 vUv;
+${frontChunk}
+uint hash3(uvec3 v) {
+  uint h = (v.x * 0x9E3779B1u) ^ (v.y * 0x85EBCA77u) ^ (v.z * 0xC2B2AE3Du);
+  h ^= h >> 15u;
+  h *= 0x2C1B3C6Du;
+  h ^= h >> 12u;
+  h *= 0x297A2D39u;
+  h ^= h >> 15u;
+  return h;
+}
 
-const float TAU = 6.2831853;
+// At most one nucleus per seed cell, jittered inside it; same test as seedNucleus on the CPU.
+// Returns whether this texel is inside one, and its center (texels).
+bool nucleus(float density, uint salt, out vec2 center) {
+  vec2 p = floor(vUv * uSimSize);
+  uvec2 cell = uvec2(p) / uint(SEED_CELL);
+  uint h = hash3(uvec3(cell, salt));
+  vec2 jitter = vec2(float((h >> 16u) & 0xFFu), float(h >> 24u)) / 255.0;
+  center = (vec2(cell) + 0.25 + 0.5 * jitter) * float(SEED_CELL);
+  return float(h & 0xFFFFu) / 65536.0 < density && distance(p + 0.5, center) < SEED_RADIUS;
+}
 
 void main() {
   vec2 c = texture2D(uState, vUv).rg;
@@ -106,41 +129,30 @@ void main() {
   vec2 se = texture2D(uState, vUv + vec2(uTexel.x, -uTexel.y)).rg;
   vec2 lap = 0.2 * (n + s + e + w) + 0.05 * (ne + nw + se + sw) - c;
 
-  // Flow: curl of a sum of plane-wave stream functions, plus an occasional Gaussian swirl
-  vec2 vel = vec2(0.0);
-  for (int i = 0; i < FLOW_WAVES; i++) {
-    vec4 fw = uFlowWaves[i];
-    vel += uFlowVel[i] * cos(TAU * dot(fw.xy, vUv) + fw.z);
-  }
-  vec2 d = vUv - uVortex.xy;
-  d -= floor(d + 0.5); // shortest wrapped offset
-  d *= uSimSize;
-  vel += uVortex.w * exp(-dot(d, d) / (uVortex.z * uVortex.z)) * vec2(-d.y, d.x);
-  vec2 o = -clamp(vel, -0.9, 0.9); // source offset in texels, kept inside the 3x3 neighbourhood
-  vec2 f = abs(o);
-  vec2 hx = o.x > 0.0 ? e : w;
-  vec2 vy = o.y > 0.0 ? n : s;
-  vec2 cr = o.x > 0.0 ? (o.y > 0.0 ? ne : se) : (o.y > 0.0 ? nw : sw);
-  vec2 adv = mix(mix(c, hx, f.x), mix(vy, cr, f.x), f.y);
+  // Signed texels behind the front (negative: not reached yet)
+  float behind = uFront.x - frontDistance(vUv);
+  vec2 fk = mix(uFeedKillOld, uFeedKillNew, smoothstep(-1.5, 1.5, behind));
+  float bleach = behind > 0.0 && behind < uFront.y ? BLEACH_KILL : 0.0;
 
-  // Traveling fronts between the two regimes
-  float band = 0.0;
-  for (int i = 0; i < FRONT_WAVES; i++) {
-    vec4 fr = uFronts[i];
-    band += fr.w * sin(TAU * dot(fr.xy, vUv) + fr.z);
-  }
-  vec2 fk = mix(uFeedKillA, uFeedKillB, smoothstep(-0.3, 0.3, band));
-  float feed = fk.x;
-  float kill = fk.y;
-
-  float a = 1.0 - adv.r;
-  float b = adv.g;
-  float lapA = -lap.r;
-  float lapB = lap.g;
-
+  float a = 1.0 - c.r;
+  float b = c.g;
   float reaction = a * b * b;
-  float na = a + lapA - reaction + feed * (1.0 - a);
-  float nb = b + 0.5 * lapB + reaction - (feed + kill) * b;
+  float na = a - lap.r - reaction + fk.x * (1.0 - a);
+  float nb = b + 0.5 * lap.g + reaction - (fk.x + fk.y + bleach) * b;
+
+  // Nuclei are held whole, keyed to their center's distance behind the front: a band sweeping
+  // across a disc would leave only thin arcs, which fizzle in the coral and worm regimes. The
+  // cheap pre-check skips the hash away from the seeding ring (wide enough for the wobble).
+  float seedStart = max(uFront.y, SEED_GAP) + SEED_RADIUS;
+  vec2 center;
+  if (uFront.z > 0.0 && abs(behind - seedStart - 0.5 * SEED_BAND) < 0.5 * SEED_BAND + 4.0 * SEED_RADIUS &&
+      nucleus(uFront.z, uint(uFront.w), center)) {
+    float centerBehind = uFront.x - frontDistance(center / uSimSize);
+    if (centerBehind > seedStart && centerBehind < seedStart + SEED_BAND) {
+      na += (0.5 - na) * 0.25;
+      nb += (0.25 - nb) * 0.25;
+    }
+  }
 
   gl_FragColor = vec4(clamp(1.0 - na, 0.0, 1.0), clamp(nb, 0.0, 1.0), 0.0, 1.0);
 }
@@ -191,18 +203,26 @@ void main() {
 
 // Treats chemical B as a height field and lights it as glossy enamel under a wandering
 // point light: gradient normals, crevice occlusion, sharp + broad specular, fresnel sheen.
+// The palette changes a few texels behind the advancing front, whose leading edge glows faintly,
+// so the viewer reads "something new is spreading through".
 const displayFragmentShader = /* glsl */ `
 uniform sampler2D uState;
 uniform vec2 uTexel;
 uniform float uAspect;
 uniform vec3 uLight;
 uniform float uBump;
-uniform vec3 uDeep;
-uniform vec3 uMid;
-uniform vec3 uPeak;
-uniform vec3 uSpec;
+uniform float uFrontRadius;
+uniform float uFrontGlow;
+uniform vec3 uDeepOld;
+uniform vec3 uMidOld;
+uniform vec3 uPeakOld;
+uniform vec3 uSpecOld;
+uniform vec3 uDeepNew;
+uniform vec3 uMidNew;
+uniform vec3 uPeakNew;
+uniform vec3 uSpecNew;
 varying vec2 vUv;
-
+${frontChunk}
 float height(vec2 uv) {
   return smoothstep(0.05, 0.32, texture2D(uState, uv).g);
 }
@@ -247,14 +267,27 @@ void main() {
   float sheen = pow(nh, 14.0);
   float fresnel = pow(1.0 - N.z, 2.0);
 
-  vec3 albedo = mix(uDeep, uMid, smoothstep(0.0, 0.55, h));
-  albedo = mix(albedo, uPeak, smoothstep(0.55, 1.0, h));
+  // Palette: new behind the front, old ahead, changing over a soft band just behind the edge
+  float behind = uFrontRadius - frontDistance(vUv);
+  float pal = smoothstep(-6.0, 18.0, behind);
+  vec3 deep = mix(uDeepOld, uDeepNew, pal);
+  vec3 mid = mix(uMidOld, uMidNew, pal);
+  vec3 peak = mix(uPeakOld, uPeakNew, pal);
+  vec3 spec = mix(uSpecOld, uSpecNew, pal);
+
+  vec3 albedo = mix(deep, mid, smoothstep(0.0, 0.55, h));
+  albedo = mix(albedo, peak, smoothstep(0.55, 1.0, h));
 
   // Raised enamel is glossier than the matte valleys between it
   float gloss = 0.25 + 0.75 * h;
   vec3 col = albedo * (0.12 + 1.5 * diffuse * falloff) * ao;
-  col += uSpec * (glint * 1.6 + sheen * 0.18) * falloff * gloss;
-  col += mix(uMid, uPeak, N.y * 0.5 + 0.5) * fresnel * 0.35 * ao;
+  col += spec * (glint * 1.6 + sheen * 0.18) * falloff * gloss;
+  col += mix(mid, peak, N.y * 0.5 + 0.5) * fresnel * 0.35 * ao;
+
+  // The front: a thin bright leading edge with a faint wash trailing behind it
+  float edge = exp(-behind * behind / 12.0);
+  float wash = behind > 0.0 ? exp(-behind / 28.0) : 0.0;
+  col += (mix(uPeakNew, uSpecNew, 0.5) * edge * 0.32 + uMidNew * wash * 0.07) * uFrontGlow;
 
   // Gentle vignette, soft shoulder, then linear -> sRGB by hand (ShaderMaterial won't)
   vec2 q = vUv - 0.5;
@@ -271,30 +304,28 @@ interface Palette {
   spec: THREE.Color
 }
 
-const toPalette = (hexes: [number, number, number, number]): Palette => ({
-  deep: new THREE.Color(hexes[0]),
-  mid: new THREE.Color(hexes[1]),
-  peak: new THREE.Color(hexes[2]),
-  spec: new THREE.Color(hexes[3]),
+const newPalette = (): Palette => ({
+  deep: new THREE.Color(),
+  mid: new THREE.Color(),
+  peak: new THREE.Color(),
+  spec: new THREE.Color(),
 })
 
-const pickOther = (count: number, current: number) => {
-  let next = Math.floor(Math.random() * (count - 1))
-  if (next >= current) next++
-  return next
+const setPalette = (p: Palette, hexes: [number, number, number, number]) => {
+  p.deep.setHex(hexes[0])
+  p.mid.setHex(hexes[1])
+  p.peak.setHex(hexes[2])
+  p.spec.setHex(hexes[3])
 }
 
-// Random regime that neither equals nor clashes with any of `avoid` (always solvable: at most
-// two avoided regimes, each ruling out at most three of the six)
-const pickRegime = (...avoid: number[]) => {
-  const options = REGIMES.map((_, i) => i).filter((i) => avoid.every((a) => !clashes(i, a)))
-  return options[Math.floor(Math.random() * options.length)]
+const copyPalette = (to: Palette, from: Palette) => {
+  to.deep.copy(from.deep)
+  to.mid.copy(from.mid)
+  to.peak.copy(from.peak)
+  to.spec.copy(from.spec)
 }
 
-const smooth = (x: number) => {
-  const t = Math.min(Math.max(x, 0), 1)
-  return t * t * (3 - 2 * t)
-}
+const frontDefines = { ORIGINS, WOBBLES }
 
 export default function ReactionDiffusion() {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -325,31 +356,31 @@ export default function ReactionDiffusion() {
     const simSize = new THREE.Vector2()
     const simTexel = new THREE.Vector2()
 
-    // Flow, fronts and vortex are computed on the CPU each frame (as small Float32Arrays, then
-    // copied into these preallocated uniform vectors)
-    const flowWaves = Array.from({ length: FLOW_WAVES }, () => new THREE.Vector4())
-    const flowVel = Array.from({ length: FLOW_WAVES }, () => new THREE.Vector2())
-    const fronts = Array.from({ length: FRONT_WAVES }, () => new THREE.Vector4())
-    const vortexUniform = new THREE.Vector4(0.5, 0.5, 1, 0)
-    const flowWaveData = new Float32Array(FLOW_WAVES * 4)
-    const flowVelData = new Float32Array(FLOW_WAVES * 2)
-    const frontData = new Float32Array(FRONT_WAVES * 4)
-    const vortexData = new Float32Array(4)
+    // Front geometry for the current phase, shared by the sim and display passes
+    const origins = Array.from({ length: ORIGINS }, () => new THREE.Vector4())
+    const wobble = Array.from({ length: WOBBLES }, () => new THREE.Vector4())
+    const front = new THREE.Vector4() // radius, bleach width, seed density, seed salt
 
     const simMaterial = new THREE.ShaderMaterial({
       vertexShader,
       fragmentShader: simFragmentShader,
-      defines: { FLOW_WAVES, FRONT_WAVES },
+      defines: {
+        ...frontDefines,
+        SEED_CELL,
+        SEED_RADIUS: glslFloat(SEED_RADIUS),
+        SEED_GAP: glslFloat(SEED_GAP),
+        SEED_BAND: glslFloat(SEED_BAND),
+        BLEACH_KILL: glslFloat(BLEACH_KILL),
+      },
       uniforms: {
         uState: { value: null },
         uTexel: { value: simTexel },
         uSimSize: { value: simSize },
-        uFeedKillA: { value: new THREE.Vector2(...REGIMES[0]) },
-        uFeedKillB: { value: new THREE.Vector2(...REGIMES[1]) },
-        uFlowWaves: { value: flowWaves },
-        uFlowVel: { value: flowVel },
-        uFronts: { value: fronts },
-        uVortex: { value: vortexUniform },
+        uFeedKillOld: { value: new THREE.Vector2() },
+        uFeedKillNew: { value: new THREE.Vector2() },
+        uOrigins: { value: origins },
+        uWobble: { value: wobble },
+        uFront: { value: front },
       },
       depthTest: false,
       depthWrite: false,
@@ -388,20 +419,32 @@ export default function ReactionDiffusion() {
     })
     const probePixels = new Uint8Array(PROBE_SIZE * PROBE_SIZE * 4)
 
-    const shown = toPalette(PALETTES[0])
+    // Palette ahead of the front (old) and behind it (new)
+    const paletteOld = newPalette()
+    const paletteNew = newPalette()
     const displayMaterial = new THREE.ShaderMaterial({
       vertexShader,
       fragmentShader: displayFragmentShader,
+      defines: frontDefines,
       uniforms: {
         uState: { value: null },
         uTexel: { value: simTexel },
+        uSimSize: { value: simSize },
         uAspect: { value: 1 },
         uLight: { value: new THREE.Vector3(0, 0, 0.6) },
         uBump: { value: BUMP },
-        uDeep: { value: shown.deep },
-        uMid: { value: shown.mid },
-        uPeak: { value: shown.peak },
-        uSpec: { value: shown.spec },
+        uOrigins: { value: origins },
+        uWobble: { value: wobble },
+        uFrontRadius: { value: 0 },
+        uFrontGlow: { value: 0 },
+        uDeepOld: { value: paletteOld.deep },
+        uMidOld: { value: paletteOld.mid },
+        uPeakOld: { value: paletteOld.peak },
+        uSpecOld: { value: paletteOld.spec },
+        uDeepNew: { value: paletteNew.deep },
+        uMidNew: { value: paletteNew.mid },
+        uPeakNew: { value: paletteNew.peak },
+        uSpecNew: { value: paletteNew.spec },
       },
       depthTest: false,
       depthWrite: false,
@@ -455,7 +498,7 @@ export default function ReactionDiffusion() {
       clearDrops()
     }
 
-    // count seeds + a share of erasers; erased holes visibly regrow from their rims
+    // count seeds + a share of erasers
     const scatterDrops = (count: number, eraseShare: number) => {
       clearDrops()
       for (let i = 0; i < Math.min(count, MAX_DROPS); i++) {
@@ -468,6 +511,11 @@ export default function ReactionDiffusion() {
         )
       }
     }
+
+    // Phase state: the cycle's plan, which phase is running, and sim-seconds into it
+    let cycle: Phase[] = []
+    let phaseIndex = 0
+    let phaseT = 0
 
     const handleResize = () => {
       const w = window.innerWidth
@@ -493,95 +541,80 @@ export default function ReactionDiffusion() {
         runPass(seedMaterial, read)
         oldRead.dispose()
         oldWrite?.dispose()
-      } else {
+      }
+      // The front's reach is measured in texels, so re-measure it for the new grid
+      if (cycle[phaseIndex]) measureFront(cycle[phaseIndex], simW, simH)
+    }
+    handleResize()
+
+    const enterPhase = (index: number) => {
+      if (index >= cycle.length) {
+        const last = cycle[cycle.length - 1]
+        cycle = planCycle(Math.random, PALETTES.length, last?.to ?? -1, last?.palette ?? -1)
+        index = 0
+      }
+      phaseIndex = index
+      phaseT = 0
+      const phase = cycle[index]
+      startPhase(phase, simSize.x, simSize.y)
+
+      ;(simMaterial.uniforms.uFeedKillOld.value as THREE.Vector2).set(REGIMES[phase.from].feed, REGIMES[phase.from].kill)
+      ;(simMaterial.uniforms.uFeedKillNew.value as THREE.Vector2).set(REGIMES[phase.to].feed, REGIMES[phase.to].kill)
+      origins.forEach((v, i) => v.fromArray(phase.origins, i * 4))
+      wobble.forEach((v, i) => v.fromArray(phase.wobble, i * 4))
+      front.set(frontRadius(phase, 0), phase.bleach, phase.seedDensity, phase.seedSalt)
+
+      // What was behind the last front is now ahead of this one
+      copyPalette(paletteOld, paletteNew)
+      setPalette(paletteNew, PALETTES[phase.palette])
+      if (phase.kind === 'spread') {
+        // A fresh board (the reset just erased it): drops grow across the screen
+        copyPalette(paletteOld, paletteNew)
         scatterDrops(INITIAL_DROPS, 0)
         applySeed(true)
       }
     }
-    handleResize()
-
-    // Regime and palette state; both glide from where they are toward a new target. Two regimes
-    // are live at once (A and B), and the traveling fronts decide which holds where.
-    let regimeIndex = Math.floor(Math.random() * REGIMES.length)
-    let regimeIndexB = pickRegime(regimeIndex)
-    const feedKillFrom = new THREE.Vector2(...REGIMES[regimeIndex])
-    const feedKillTo = feedKillFrom.clone()
-    const feedKill = simMaterial.uniforms.uFeedKillA.value as THREE.Vector2
-    feedKill.copy(feedKillFrom)
-    const feedKillFromB = new THREE.Vector2(...REGIMES[regimeIndexB])
-    const feedKillToB = feedKillFromB.clone()
-    const feedKillB = simMaterial.uniforms.uFeedKillB.value as THREE.Vector2
-    feedKillB.copy(feedKillFromB)
-
-    let paletteIndex = Math.floor(Math.random() * PALETTES.length)
-    let paletteFrom = toPalette(PALETTES[paletteIndex])
-    let paletteTo = toPalette(PALETTES[paletteIndex])
-    shown.deep.copy(paletteTo.deep)
-    shown.mid.copy(paletteTo.mid)
-    shown.peak.copy(paletteTo.peak)
-    shown.spec.copy(paletteTo.spec)
+    enterPhase(0)
 
     const startTime = performance.now()
     let lastTime = startTime
-    let cycleStart = startTime
-    let lastSprinkle = startTime
     let lastProbe = startTime
     let probePending = false
     let disposed = false
     let stepDebt = 0
     let animationId = 0
 
-    const flowField = createWaveField(FLOW_BANDS, 0, Math.random)
-    const frontField = createWaveField(FRONT_BANDS, 0, Math.random)
-    const vortex = createVortex(0, Math.random)
-
     // Now and then, read back a tiny map of B; if the field has died out or filled solid,
-    // re-seed or punch holes rather than waiting for the next scheduled drops
+    // re-seed or punch holes. Off while the reset deliberately erases the board and while a
+    // fresh spread is still small.
+    const guardActive = () => {
+      const phase = cycle[phaseIndex]
+      return phase.kind === 'transform' || (phase.kind === 'spread' && phaseT > GUARD_GRACE_SECONDS)
+    }
     const probeCoverage = () => {
-      if (probePending || !read) return
+      if (probePending || !read || !guardActive()) return
       probeMaterial.uniforms.uState.value = read.texture
       runPass(probeMaterial, probeTarget)
       probePending = true
       renderer
         .readRenderTargetPixelsAsync(probeTarget, 0, 0, PROBE_SIZE, PROBE_SIZE, probePixels)
         .then(() => {
-          if (disposed) return
+          if (disposed || !guardActive()) return
           const share = coverage(probePixels)
           if (share < DEAD_COVERAGE) {
             scatterDrops(INITIAL_DROPS, 0)
             applySeed(false)
           } else if (share > SOLID_COVERAGE) {
-            scatterDrops(CYCLE_DROPS, 1)
+            scatterDrops(RESCUE_DROPS, 1)
             applySeed(false)
           }
         })
         .catch(() => {
-          // Readback unsupported or context lost: the scheduled drops still keep things going
+          // Readback unsupported or context lost: the phases still move things along
         })
         .finally(() => {
           probePending = false
         })
-    }
-
-    const startCycle = (now: number) => {
-      cycleStart = now
-      lastSprinkle = now
-      feedKillFrom.copy(feedKill)
-      regimeIndex = pickRegime(regimeIndex)
-      feedKillTo.set(...REGIMES[regimeIndex])
-      feedKillFromB.copy(feedKillB)
-      regimeIndexB = pickRegime(regimeIndex, regimeIndexB)
-      feedKillToB.set(...REGIMES[regimeIndexB])
-      paletteFrom = {
-        deep: shown.deep.clone(),
-        mid: shown.mid.clone(),
-        peak: shown.peak.clone(),
-        spec: shown.spec.clone(),
-      }
-      paletteIndex = pickOther(PALETTES.length, paletteIndex)
-      paletteTo = toPalette(PALETTES[paletteIndex])
-      scatterDrops(CYCLE_DROPS, 0.35)
-      applySeed(false)
     }
 
     const animate = () => {
@@ -592,34 +625,18 @@ export default function ReactionDiffusion() {
       lastTime = now
       const t = (now - startTime) / 1000
 
-      if ((now - cycleStart) / 1000 >= CYCLE_SECONDS) {
-        startCycle(now)
-      } else if ((now - lastSprinkle) / 1000 >= SPRINKLE_SECONDS) {
-        lastSprinkle = now
-        scatterDrops(SPRINKLE_DROPS, 0.5)
-        applySeed(false)
-      }
-
-      const cycleT = (now - cycleStart) / 1000
-      const rb = smooth(cycleT / REGIME_BLEND_SECONDS)
-      feedKill.lerpVectors(feedKillFrom, feedKillTo, rb)
-      feedKillB.lerpVectors(feedKillFromB, feedKillToB, rb)
-      const pb = smooth(cycleT / PALETTE_BLEND_SECONDS)
-      shown.deep.lerpColors(paletteFrom.deep, paletteTo.deep, pb)
-      shown.mid.lerpColors(paletteFrom.mid, paletteTo.mid, pb)
-      shown.peak.lerpColors(paletteFrom.peak, paletteTo.peak, pb)
-      shown.spec.lerpColors(paletteFrom.spec, paletteTo.spec, pb)
-
       stepDebt += frameSeconds * STEPS_PER_SECOND
       const steps = Math.min(Math.floor(stepDebt), MAX_STEPS_PER_FRAME)
       stepDebt = Math.min(stepDebt - steps, 1)
-      updateFlow(flowField, t, simSize.x, simSize.y, FLOW_SPEED, flowWaveData, flowVelData)
-      updateFronts(frontField, t, frontData)
-      updateVortex(vortex, t, simSize.x, simSize.y, Math.random, vortexData)
-      flowWaves.forEach((v, i) => v.fromArray(flowWaveData, i * 4))
-      flowVel.forEach((v, i) => v.fromArray(flowVelData, i * 2))
-      fronts.forEach((v, i) => v.fromArray(frontData, i * 4))
-      vortexUniform.fromArray(vortexData)
+
+      // Phases run on sim time, so a slow GPU sees the same front speed relative to the pattern
+      phaseT += steps / STEPS_PER_SECOND
+      if (phaseT >= phaseSeconds(cycle[phaseIndex])) enterPhase(phaseIndex + 1)
+      const phase = cycle[phaseIndex]
+      front.x = frontRadius(phase, phaseT)
+      displayMaterial.uniforms.uFrontRadius.value = front.x
+      displayMaterial.uniforms.uFrontGlow.value = phase.kind === 'spread' ? 0 : Math.min(phaseT / GLOW_FADE_SECONDS, 1)
+
       for (let i = 0; i < steps; i++) {
         simMaterial.uniforms.uState.value = read!.texture
         runPass(simMaterial, write)

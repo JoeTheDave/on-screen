@@ -7,10 +7,11 @@ import { ATTRACTORS, step, warmUp, type AttractorStats } from './attractors'
 
 // Configuration constants
 const PARTICLE_COUNT = 20000
-// Bloom only on the brightest heads, and gently, so dense regions keep their structure
-const BLOOM_STRENGTH = 0.35
-const BLOOM_RADIUS = 0.4
-const BLOOM_THRESHOLD = 0.6
+// A real halo around every streak, but over normal-blended particles: a clump's brightness is
+// capped at its own color, so the glow can't snowball into a white blob
+const BLOOM_STRENGTH = 0.75
+const BLOOM_RADIUS = 0.55
+const BLOOM_THRESHOLD = 0.25
 const ATTRACTOR_SECONDS = 45 // time on each attractor before the equations switch
 const WORLD_SPEED = 0.35 // mean particle speed, in attractor radii per second
 const TRAIL_SECONDS = 0.15 // streak length, as seconds of travel
@@ -202,7 +203,7 @@ export default function StrangeAttractors() {
         const speed = Math.hypot(velocity[0], velocity[1], velocity[2]) / stats.meanSpeed
         const ratio = Math.min(speed / 1.8, 1)
         const hue = (((hueSlow + (hueFast - hueSlow) * ratio) % 1) + 1) % 1
-        color.setHSL(hue, 0.85, 0.42 + ratio * 0.18)
+        color.setHSL(hue, 0.85, 0.45 + ratio * 0.25)
         const c = p * 8
         segmentColors[c] = segmentColors[c + 4] = color.r
         segmentColors[c + 1] = segmentColors[c + 5] = color.g

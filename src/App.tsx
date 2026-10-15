@@ -14,12 +14,14 @@ import WaveGrid from './visualizations/WaveGrid'
 import StrangeAttractors from './visualizations/StrangeAttractors'
 import ReactionDiffusion from './visualizations/ReactionDiffusion'
 import Aurora from './visualizations/Aurora'
-import Mandelbulb from './visualizations/Mandelbulb'
 import GalaxyCollision from './visualizations/GalaxyCollision'
 import InkFluid from './visualizations/InkFluid'
 import BlackHole from './visualizations/BlackHole'
 import Hypercube from './visualizations/Hypercube'
 import TerrainFlight from './visualizations/TerrainFlight'
+import Tornado from './visualizations/Tornado'
+import AtomicBomb from './visualizations/AtomicBomb'
+import Prism from './visualizations/Prism'
 // import Snakes from './visualizations/Snakes'
 
 const VISUALIZATIONS = [
@@ -36,12 +38,14 @@ const VISUALIZATIONS = [
   { id: 'strange-attractors', name: 'Strange Attractors', component: StrangeAttractors },
   { id: 'reaction-diffusion', name: 'Reaction Diffusion', component: ReactionDiffusion },
   { id: 'aurora', name: 'Aurora', component: Aurora },
-  { id: 'mandelbulb', name: 'Mandelbulb', component: Mandelbulb },
   { id: 'galaxy-collision', name: 'Galaxy Collision', component: GalaxyCollision },
   { id: 'ink-fluid', name: 'Ink in Water', component: InkFluid },
   { id: 'black-hole', name: 'Black Hole', component: BlackHole },
   { id: 'hypercube', name: 'Hypercube', component: Hypercube },
   { id: 'terrain-flight', name: 'Terrain Flight', component: TerrainFlight },
+  { id: 'tornado', name: 'Tornado', component: Tornado },
+  { id: 'atomic-bomb', name: 'Atomic Bomb', component: AtomicBomb },
+  { id: 'prism', name: 'Prism', component: Prism },
   // { id: 'snakes', name: 'Snakes', component: Snakes },
 ]
 

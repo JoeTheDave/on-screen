@@ -1,11 +1,13 @@
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
-import { Flight, PERIOD } from './terrainMath'
+import { mergeGeometries, mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
+import { Flight, Forest, PERIOD, TREE_FADE_START, TREE_RADIUS, TREE_THIN_DISTANCE, type ForestBounds } from './terrainMath'
 
 // Configuration constants
 const RENDER_SCALE = 0.5 // raymarch resolution relative to CSS pixels, then upscaled
 const MIN_RENDER_SCALE = 0.3 // floor for the automatic quality ratchet on slow GPUs
 const MAX_RENDER_PIXELS = 700_000 // cap on large/4K screens so one frame can never stall the GPU
+const MSAA_SAMPLES = 4 // tree edges are rasterized, so they get real antialiasing
 const SLOW_FRAME_SECONDS = 1 / 45 // average frame time that triggers a resolution drop
 const DAY_SECONDS = 240 // one full day/night cycle (night runs faster, see below)
 const NIGHT_SPEEDUP = 0.7 // night passes this much faster than day
@@ -13,6 +15,15 @@ const BIOME_MIN_SECONDS = 45 // time between re-randomized biomes / flight style
 const BIOME_MAX_SECONDS = 80
 const BIOME_BLEND_SECONDS = 15
 const TAN_HALF_FOV = 0.5 // vertical, about 53 degrees
+const CAMERA_NEAR = 0.006 // the flight floor keeps every tree at least ~0.01 away
+const CAMERA_FAR = 40
+const MAX_TREES = 30_000 // instance slots; a safety cap (the nearest trees win if a forest is ever denser)
+const FOREST_BUDGET_MS = 1.2 // CPU time per frame for populating new forest tiles
+const FOREST_STARTUP_MS = 300 // populated up front so the first frames already have forests
+const FOREST_REBUILD_SECONDS = 0.4 // how often the visible instance list is rewritten
+const CULL_FOV_MARGIN = 1.3 // the visible list covers a wider view than the camera's...
+const CULL_ASPECT_MARGIN = 1.15 // ...so turning between rebuilds never shows a gap
+const TRUNK_COLOR = '#3a2a1e'
 const SKY_CLEAR_COLOR = 0x000000
 
 // Biomes are palettes plus a few terrain-shading knobs. Colors are sRGB hex and get
@@ -25,32 +36,32 @@ interface Biome {
   snowLine: number // absolute height where snow starts (terrain spans roughly -0.9..1.2)
   strata: number // 0..1 strength of horizontal rock banding (canyon look)
   waterLevel: number
-  tree: string // canopy colors (each tree picks a mix of the two)
-  tree2: string
+  conifer: [string, string] // needle colors (each tree picks a mix of the two)
+  leaf: [string, string] // broadleaf crown colors
   treeDensity: number // 0 = no trees
   treeSize: number // 0..1 scale on the tallest tree (keep <= 1: the camera's floor assumes it)
-  conifer: number // fraction of trees that are conifers (the rest are rounded broadleaf)
+  coniferShare: number // fraction of trees that are conifers (the rest are broadleaf)
 }
 
 const BIOMES: Biome[] = [
-  // Alpine: green valleys, grey rock, snow caps, cold lakes
+  // Alpine: green valleys, grey rock, snow caps, cold lakes, dark spruce forests
   { grass: '#3d5a1e', rock: '#6e655c', sand: '#a89a7a', water: '#0d2a33', snowLine: 0.36, strata: 0.1, waterLevel: -0.15,
-    tree: '#16301a', tree2: '#25401f', treeDensity: 0.9, treeSize: 1, conifer: 0.85 },
-  // Autumn highlands: rust and gold slopes
+    conifer: ['#1d3b2a', '#2e4a2a'], leaf: ['#3f6a2a', '#5a7a30'], treeDensity: 0.9, treeSize: 1, coniferShare: 0.85 },
+  // Autumn highlands: rust and gold slopes, blazing maples among dark pines
   { grass: '#8a5420', rock: '#6a5a50', sand: '#a08a68', water: '#102a30', snowLine: 0.55, strata: 0.15, waterLevel: -0.14,
-    tree: '#9a2e14', tree2: '#c8801a', treeDensity: 0.85, treeSize: 0.95, conifer: 0.2 },
-  // Red desert canyons: banded sandstone, sparse scrub, turquoise water
+    conifer: ['#22402c', '#34502e'], leaf: ['#b8401a', '#e0a028'], treeDensity: 0.85, treeSize: 0.95, coniferShare: 0.2 },
+  // Red desert canyons: banded sandstone, sparse olive scrub, turquoise water
   { grass: '#7a6234', rock: '#a0502a', sand: '#c89a68', water: '#0c3a3a', snowLine: 9, strata: 0.85, waterLevel: -0.24,
-    tree: '#4a4a26', tree2: '#6a6038', treeDensity: 0.14, treeSize: 0.55, conifer: 0 },
-  // Heather moors: purple-brown slopes, slate rock
+    conifer: ['#3a4a2a', '#4c5630'], leaf: ['#6a6a34', '#8a7a44'], treeDensity: 0.18, treeSize: 0.6, coniferShare: 0.1 },
+  // Heather moors: purple-brown slopes, slate rock, scattered dark copses
   { grass: '#5a3a52', rock: '#5c5c64', sand: '#8a8070', water: '#0c1e2e', snowLine: 0.62, strata: 0.2, waterLevel: -0.12,
-    tree: '#1e2c1c', tree2: '#2e3a24', treeDensity: 0.35, treeSize: 0.85, conifer: 0.6 },
-  // Emerald lowlands: lush green, dark rock, lots of water
+    conifer: ['#1e3226', '#2a3e2a'], leaf: ['#3a4a26', '#55602e'], treeDensity: 0.35, treeSize: 0.85, coniferShare: 0.6 },
+  // Emerald lowlands: lush green, dark rock, lots of water, bright broadleaf woods
   { grass: '#2a6a2c', rock: '#4e4a42', sand: '#b0a07a', water: '#0a3030', snowLine: 0.8, strata: 0.05, waterLevel: -0.08,
-    tree: '#164a1c', tree2: '#2a6426', treeDensity: 1, treeSize: 1, conifer: 0.3 },
-  // Volcanic: black rock, acid-green moss, heavy snow
+    conifer: ['#1a4228', '#2a5a30'], leaf: ['#3a8a30', '#62a03a'], treeDensity: 1, treeSize: 1, coniferShare: 0.3 },
+  // Volcanic: black rock, acid-green moss, heavy snow, a few hardy black pines
   { grass: '#4a5a1a', rock: '#2a2628', sand: '#4a4440', water: '#081a20', snowLine: 0.28, strata: 0.3, waterLevel: -0.18,
-    tree: '#1a2214', tree2: '#2a3018', treeDensity: 0, treeSize: 0.8, conifer: 0.7 },
+    conifer: ['#1a2a1e', '#24331f'], leaf: ['#3a4a1e', '#4a5a24'], treeDensity: 0.3, treeSize: 0.8, coniferShare: 0.8 },
 ]
 
 // Sky keyframes indexed by sun elevation (sin of altitude). Dawn and dusk use different
@@ -85,11 +96,10 @@ void main() {
 }
 `
 
-// The landscape: raymarched heightfield, water with reflections, sky, fog, tonemapping.
-// No ${} interpolations so the shipped source is byte-identical to what was validated.
-const TERRAIN_FRAG = /* glsl */ `
-varying vec2 vUv;
-
+// Everything the landscape, the trees and their ground shadows must agree on: the terrain
+// function, sky and fog, terrain shadows and the final tonemap. Each fragment shader starts
+// with this, so a tree and the ground behind it are lit, fogged and graded identically.
+const COMMON_GLSL = /* glsl */ `
 uniform vec2 uResolution;
 uniform float uTime;
 uniform vec3 uCamPos;
@@ -97,6 +107,9 @@ uniform vec3 uCamRight;
 uniform vec3 uCamUp;
 uniform vec3 uCamFwd;
 uniform float uTanHalfFov;
+uniform float uNear;
+uniform float uFar;
+uniform vec2 uOriginW;
 uniform vec3 uSunDir;
 uniform vec3 uMoonDir;
 uniform vec3 uLightDir;
@@ -119,23 +132,11 @@ uniform vec3 uSand;
 uniform vec3 uWaterCol;
 uniform float uSnowLine;
 uniform float uStrata;
-uniform vec3 uTreeCol;
-uniform vec3 uTreeCol2;
-uniform float uTreeDensity;
-uniform float uTreeSize;
-uniform float uConifer;
 
 #define PER 256.0
 #define MASK_PER 16.0
-#define FAR 16.0
+#define FAR 24.0
 #define MAXH 1.4
-// Trees: a jittered grid of 1/40-unit cells (40 * PER = 10240 cells per period, so the
-// forest repeats with the terrain). TREE_H mirrors TREE_MAX_HEIGHT in terrainMath.ts.
-#define TREE_CELLS 40.0
-#define TREE_WRAP 10240.0
-#define TREE_H 0.018
-#define TREE_FADE 1.3
-#define TREE_FAR 2.6
 
 // Integer hash (lowbias32-style); mirrored exactly in terrainMath.ts
 uint ihash(uvec2 q) {
@@ -193,123 +194,26 @@ float terrain(vec2 x, int oct) {
   return amp * a + (region - 0.5) * 0.5;
 }
 
-// terrain(x, 7) plus an approximate large-scale gradient (first 4 octaves, chain rule
-// through the octave matrix, ignoring the erosion term's own derivative). The gradient is
-// only used to keep trees off steep ground: it reads about 0.4x the true slope, but ranks
-// steepness well enough (thresholds in treeDensity are tuned to its scale).
-vec3 terrainG(vec2 x) {
+// The same surface with a fractional octave count: the last octave fades in, so detail can
+// follow distance continuously (no visible LOD steps). Used only for shading normals.
+float terrainL(vec2 x, float oct) {
   float region = 0.5 + 0.5 * noised(mod(x / MASK_PER, MASK_PER), MASK_PER).x;
   vec2 p = mod(x, PER);
   float a = 0.0;
   float b = 1.0;
   vec2 d = vec2(0.0);
-  vec2 ga = vec2(0.0);
-  vec4 J = vec4(1.0, 0.0, 0.0, 1.0); // octave i samples at J * x (rows J.xy, J.zw)
-  for (int i = 0; i < 7; i++) {
+  for (int i = 0; i < 10; i++) {
+    float w = clamp(oct - float(i), 0.0, 1.0);
+    if (w <= 0.0) break;
     vec3 n = noised(p, PER);
-    d += n.yz;
-    float den = 1.0 + dot(d, d);
-    a += b * n.x / den;
-    if (i < 4) {
-      ga += (b / den) * vec2(J.x * n.y + J.z * n.z, J.y * n.y + J.w * n.z);
-      J = vec4(2.0 * J.x - J.z, 2.0 * J.y - J.w, J.x + 2.0 * J.z, J.y + 2.0 * J.w);
-    }
+    d += w * n.yz;
+    a += w * b * n.x / (1.0 + dot(d, d));
     b *= 0.47;
     p = mod(vec2(2.0 * p.x - p.y, p.x + 2.0 * p.y), PER);
   }
   float amp = mix(0.16, 0.7, smoothstep(0.25, 0.8, region));
-  return vec3(amp * a + (region - 0.5) * 0.5, amp * ga);
+  return amp * a + (region - 0.5) * 0.5;
 }
-
-// ---------------------------------------------------------------- trees
-
-// How likely a tree is at xz: densest on gentle ground at middling heights, none on steep
-// rock, beaches, water or near the snow line, with forests and clearings mixed in
-float treeDensity(vec2 xz, float gy, vec2 grad) {
-  float aw = gy - uWater;
-  float dens = uTreeDensity
-             * (1.0 - smoothstep(0.2, 0.4, length(grad)))
-             * smoothstep(0.025, 0.07, aw)
-             * (1.0 - smoothstep(0.55, 0.95, aw))
-             * (1.0 - smoothstep(uSnowLine - 0.25, uSnowLine - 0.03, gy));
-  if (dens <= 0.0) return 0.0;
-  float m = noised(mod(xz * 3.0, PER), PER).x;
-  return dens * smoothstep(-0.6, -0.05, m);
-}
-
-// Canopy height above the ground at xz (0 = no tree). Only the 2x2 nearest cells are
-// checked: trees sit at most 0.25 cell from their cell centre with radius <= 0.5 cell, so
-// nothing from any other cell can reach xz. Also returns the horizontal distance to the
-// nearest tree edge (a safe march step), the hit tree's outward direction + normalized
-// radius + conifer flag in shape, and (color variation, full height, radius) in info.
-float trees(vec2 xz, float dens, float scale, out float clear, out vec4 shape, out vec3 info) {
-  vec2 g = xz * TREE_CELLS;
-  vec2 base = floor(g - 0.5);
-  float best = 0.0;
-  clear = 0.25;
-  shape = vec4(0.0, 0.0, 1.0, 0.0);
-  info = vec3(0.0);
-  for (int k = 0; k < 4; k++) {
-    vec2 c = base + vec2(float(k & 1), float(k >> 1));
-    uint h = ihash(uvec2(mod(c, TREE_WRAP)) ^ uvec2(0x9e3779b9u, 0x7f4a7c15u));
-    float r0 = float(h & 255u) * (1.0 / 255.0);
-    // Trees near a density edge shrink instead of popping
-    float grow = clamp((dens - r0) * 8.0, 0.0, 1.0);
-    if (grow <= 0.0) continue;
-    vec2 ctr = c + 0.5 + 0.5 * (vec2(float((h >> 8u) & 255u), float((h >> 16u) & 255u)) * (1.0 / 255.0) - 0.5);
-    float r1 = float((h >> 24u) & 15u) * (1.0 / 15.0);
-    bool con = (float(h >> 28u) + 0.5) * (1.0 / 16.0) < uConifer;
-    float size = (0.65 + 0.35 * r1) * grow;
-    float R = con ? 0.32 + 0.12 * size : 0.38 + 0.12 * size;
-    float q = length(g - ctr);
-    clear = min(clear, q - R);
-    if (q < R) {
-      float x = q / R;
-      float full = size * scale * TREE_H * (con ? 1.0 : 0.75);
-      float ht = full * (con ? 1.0 - x : pow(1.0 - x * x, 0.6));
-      if (ht > best) {
-        best = ht;
-        shape = vec4((g - ctr) / max(q, 1e-4), x, con ? 1.0 : 0.0);
-        info = vec3(r1, full, R / TREE_CELLS);
-      }
-    }
-  }
-  clear /= TREE_CELLS;
-  return best;
-}
-
-// Soft shadows cast by trees onto the ground or other trees: a few probes toward the
-// light, comparing canopy height with the shadow ray's height over (locally planar) ground
-float treeShadow(vec3 p, float hAbove, vec2 grad, float dens, float scale) {
-  vec3 L = uLightDir;
-  if (L.y <= 0.0 || dens <= 0.0 || scale <= 0.0) return 1.0;
-  float occ = 0.0;
-  float c;
-  vec4 s4;
-  vec3 i3;
-  for (int k = 1; k <= 3; k++) {
-    float s = 0.009 * float(k);
-    vec2 q = p.xz + L.xz * s;
-    float hq = hAbove + L.y * s - dot(grad, L.xz * s);
-    float tr = trees(q, dens, scale, c, s4, i3);
-    occ = max(occ, clamp((tr - hq) / (0.3 * TREE_H), 0.0, 1.0));
-  }
-  return 1.0 - 0.8 * occ;
-}
-
-float fbmClouds(vec2 p) {
-  p = mod(p, PER);
-  float a = 0.0;
-  float b = 0.55;
-  for (int i = 0; i < 4; i++) {
-    a += b * noised(p, PER).x;
-    b *= 0.5;
-    p = mod(vec2(2.0 * p.x - p.y, p.x + 2.0 * p.y), PER);
-  }
-  return a;
-}
-
-// ---------------------------------------------------------------- sky
 
 // Sky gradient + sun/moon glow only. Also used as the fog color so distant terrain melts
 // seamlessly into the horizon.
@@ -321,6 +225,70 @@ vec3 skyColor(vec3 rd) {
   float md = max(dot(rd, uMoonDir), 0.0);
   col += vec3(0.35, 0.45, 0.7) * uNight * (0.03 * pow(md, 8.0) + 0.12 * pow(md, 200.0));
   return col;
+}
+
+// Aerial perspective: distance haze plus mist that pools in the valleys. The view-distance
+// limit fades in over a wide band (a third of FAR to FAR) so a big distant mountain never
+// has its far half dissolving while its near half stays solid.
+float fogAmount(float t, vec3 ro, vec3 rd) {
+  float hb = 2.2;
+  float base = exp(-max(ro.y, -1.0) * hb);
+  float k = rd.y * hb;
+  float heightTerm = abs(k) < 1e-3 ? base * t : base * (1.0 - exp(-t * k)) / k;
+  float dens = uFogDensity * (0.35 * t + 0.6 * heightTerm);
+  float fo = 1.0 - exp(-dens);
+  return max(fo, smoothstep(FAR * 0.35, FAR, t));
+}
+
+vec3 applyFog(vec3 col, float t, vec3 ro, vec3 rd) {
+  return mix(col, skyColor(rd), fogAmount(t, ro, rd));
+}
+
+float softShadow(vec3 ro, vec3 rd) {
+  float res = 1.0;
+  float t = 0.02;
+  for (int i = 0; i < 32; i++) {
+    vec3 p = ro + rd * t;
+    if (p.y > MAXH) break;
+    float h = p.y - terrain(p.xz, 5);
+    res = min(res, 10.0 * h / t);
+    if (res < 0.01) break;
+    t += clamp(h * 0.7, 0.012, 0.35);
+  }
+  res = clamp(res, 0.0, 1.0);
+  return res * res * (3.0 - 2.0 * res);
+}
+
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+// Tonemap, gamma, and dither before the 8-bit render target (keeps dusk gradients smooth)
+vec3 finish(vec3 col) {
+  col = aces(col * 1.1);
+  col = pow(col, vec3(1.0 / 2.2));
+  float dn = hash01(mod(gl_FragCoord.xy, 4096.0));
+  return col + (dn - 0.5) / 255.0;
+}
+`
+
+// The landscape: raymarched heightfield, water with reflections, sky, fog, tonemapping.
+// It also writes depth (matching the tree camera's projection) so the rasterized trees
+// and the raymarched ground hide each other correctly.
+const TERRAIN_FRAG = /* glsl */ `
+${COMMON_GLSL}
+varying vec2 vUv;
+
+float fbmClouds(vec2 p) {
+  p = mod(p, PER);
+  float a = 0.0;
+  float b = 0.55;
+  for (int i = 0; i < 4; i++) {
+    a += b * noised(p, PER).x;
+    b *= 0.5;
+    p = mod(vec2(2.0 * p.x - p.y, p.x + 2.0 * p.y), PER);
+  }
+  return a;
 }
 
 vec3 stars(vec3 rd) {
@@ -369,63 +337,34 @@ vec3 skyFull(vec3 rd) {
   return mix(col, cloud, cov * hz * 0.85);
 }
 
-// ---------------------------------------------------------------- terrain
-
-// Heightfield march. Within TREE_FAR the canopy layer is added, but trees are only looked
-// up while the ray is inside the canopy band just above the ground (and where the density
-// says trees can grow); everywhere else it is the plain terrain march.
-float march(vec3 ro, vec3 rd, float tmax, out float onTree) {
+// Heightfield march. Steps are half the height above the ground but never shorter than
+// about two pixels' footprint: rays that graze a ridge used to crawl along it in tiny
+// steps and run out of iterations, and those pixels were then drawn as ground hanging in
+// the air above the peak (the shimmering "melting" tops). Crossing the surface is refined
+// by bisection, and a ray that does run out is sky, never phantom ground.
+float march(vec3 ro, vec3 rd, float tmax) {
   float t = 0.004;
-  float tAbove = 0.0; // bracket around the surface once the ray has gone through it
-  float tBelow = 1e9;
-  onTree = 0.0;
-  float invXZ = 1.0 / max(length(rd.xz), 0.1);
-  for (int i = 0; i < 150; i++) {
+  float tPrev = t;
+  for (int i = 0; i < 250; i++) {
     vec3 p = ro + rd * t;
     if (t > tmax || (rd.y >= 0.0 && p.y > MAXH)) return 1e5;
-    float h;
-    float stp;
-    float scale = uTreeSize * smoothstep(TREE_FAR, TREE_FADE, t);
-    if (scale > 0.0 && uTreeDensity > 0.0) {
-      vec3 tg = terrainG(p.xz);
-      h = p.y - tg.x;
-      stp = 0.4 * h;
-      float band = TREE_H * scale;
-      onTree = 0.0;
-      if (h < band + 0.004) {
-        float dens = treeDensity(p.xz, tg.x, tg.yz);
-        if (dens > 0.0) {
-          float clear;
-          vec4 s4;
-          vec3 i3;
-          float tr = trees(p.xz, dens, scale, clear, s4, i3);
-          if (tr > 0.0) {
-            h -= tr;
-            stp = min(stp, 0.3 * h);
-            onTree = 1.0;
-          } else {
-            // No tree here: safe to move horizontally to the nearest tree edge (plus a bit,
-            // as canopies start low at their rims), or down to the top of the canopy band
-            stp = min(stp, max(clear * invXZ + 0.25 * h, 0.3 * (h - band)));
-          }
-        }
-      }
-    } else {
-      h = p.y - terrain(p.xz, 7);
-      stp = 0.4 * h;
-    }
-    if (abs(h) < 0.0005 * t || tBelow - tAbove < 0.0002 * t) return t;
-    // Overshot (steep canopy sides can do this): bisect the bracket instead of stepping
-    // back, which could otherwise ping-pong at a tree's edge
+    float h = p.y - terrain(p.xz, 7);
     if (h < 0.0) {
-      tBelow = t;
-      t = 0.5 * (tAbove + t);
-    } else {
-      tAbove = t;
-      t = min(t + stp, 0.5 * (t + tBelow));
+      float a = tPrev;
+      float b = t;
+      for (int j = 0; j < 6; j++) {
+        float m = 0.5 * (a + b);
+        vec3 q = ro + rd * m;
+        if (q.y - terrain(q.xz, 7) < 0.0) b = m;
+        else a = m;
+      }
+      return 0.5 * (a + b);
     }
+    if (h < 0.0003 * t) return t;
+    tPrev = t;
+    t += max(0.5 * h, 0.003 * t);
   }
-  return t < tmax ? t : 1e5;
+  return 1e5;
 }
 
 // Cheaper march for reflections in water
@@ -435,48 +374,27 @@ float marchRefl(vec3 ro, vec3 rd, float tmax) {
     vec3 p = ro + rd * t;
     if (t > tmax || p.y > MAXH) return 1e5;
     float h = p.y - terrain(p.xz, 5);
-    if (abs(h) < 0.002 * t) return t;
-    t += 0.5 * h;
+    if (h < 0.002 * t) return t;
+    t += max(0.5 * h, 0.004 * t);
   }
   return 1e5;
 }
 
-vec3 calcNormal(vec3 p, float t, int oct) {
-  float e = max(0.0004, 0.0012 * t);
+// Shading normal with detail matched to the pixel footprint: octaves finer than a pixel
+// only add per-frame sparkle (and flickering snow) as the camera moves
+vec3 calcNormal(vec3 p, float t, float oct) {
+  float e = max(0.0004, 0.0016 * t);
   return normalize(vec3(
-    terrain(p.xz - vec2(e, 0.0), oct) - terrain(p.xz + vec2(e, 0.0), oct),
+    terrainL(p.xz - vec2(e, 0.0), oct) - terrainL(p.xz + vec2(e, 0.0), oct),
     2.0 * e,
-    terrain(p.xz - vec2(0.0, e), oct) - terrain(p.xz + vec2(0.0, e), oct)));
+    terrainL(p.xz - vec2(0.0, e), oct) - terrainL(p.xz + vec2(0.0, e), oct)));
 }
 
-float softShadow(vec3 ro, vec3 rd) {
-  float res = 1.0;
-  float t = 0.02;
-  for (int i = 0; i < 32; i++) {
-    vec3 p = ro + rd * t;
-    if (p.y > MAXH) break;
-    float h = p.y - terrain(p.xz, 5);
-    res = min(res, 10.0 * h / t);
-    if (res < 0.01) break;
-    t += clamp(h * 0.7, 0.012, 0.35);
-  }
-  res = clamp(res, 0.0, 1.0);
-  return res * res * (3.0 - 2.0 * res);
+float normalOctaves(float t) {
+  return clamp(7.5 - 1.25 * log(t), 3.0, 10.0);
 }
 
-// Shared lighting for terrain and trees: sun/moon key light with shadow, sky ambient and a
-// little bounce light
-vec3 lightIt(vec3 col, vec3 n, float sh, float ao) {
-  vec3 L = uLightDir;
-  float dif = clamp(dot(n, L), 0.0, 1.0) * sh;
-  float amb = (0.55 + 0.45 * n.y) * ao;
-  float bou = clamp(0.5 - 0.5 * dot(n, normalize(vec3(L.x, 0.0, L.z) + 1e-4)), 0.0, 1.0) * (1.0 - 0.5 * n.y);
-  return col * (uLightCol * dif * 2.2 + uAmbient * amb + uLightCol * 0.12 * bou * ao);
-}
-
-// dens: tree density here. treeFade: 1 where 3D trees are fully drawn, falling to 0 at
-// TREE_FAR; the faded-out share of the forest is drawn as a canopy texture instead
-vec3 shadeTerrain(vec3 p, vec3 n, vec3 rd, float sh, float dens, float treeFade) {
+vec3 shadeTerrain(vec3 p, vec3 n, vec3 rd, float sh) {
   float aboveWater = p.y - uWater;
   float v1 = noised(mod(p.xz * 6.0, PER), PER).x;
   float v2 = noised(mod(p.xz * 37.0, PER), PER).x;
@@ -495,49 +413,23 @@ vec3 shadeTerrain(vec3 p, vec3 n, vec3 rd, float sh, float dens, float treeFade)
                 * smoothstep(0.5, 0.72, n.y + 0.1 * v2);
   col = mix(col, vec3(0.8, 0.84, 0.9), snowAmt);
 
-  // Forests: the floor under near trees is darker; distant forests (where the 3D trees
-  // have shrunk away) become a rough, dark canopy texture, so nothing pops
-  float cover = dens * 0.6 * (1.0 - snowAmt);
-  vec3 canopy = mix(uTreeCol, uTreeCol2, 0.5 + 0.5 * v2) * (0.55 + 0.25 * v1 + 0.2 * v2);
-  col = mix(col, col * 0.6, cover * treeFade);
-  col = mix(col, canopy, cover * (1.0 - treeFade) * 1.4);
-
-  col = lightIt(col, n, sh, 1.0);
-
   vec3 L = uLightDir;
+  float dif = clamp(dot(n, L), 0.0, 1.0) * sh;
+  float amb = 0.55 + 0.45 * n.y;
+  float bou = clamp(0.5 - 0.5 * dot(n, normalize(vec3(L.x, 0.0, L.z) + 1e-4)), 0.0, 1.0) * (1.0 - 0.5 * n.y);
+  vec3 lin = uLightCol * dif * 2.2 + uAmbient * amb + uLightCol * 0.12 * bou;
+  col *= lin;
+
   vec3 hv = normalize(L - rd);
   col += snowAmt * uLightCol * 0.35 * pow(clamp(dot(n, hv), 0.0, 1.0), 24.0) * sh;
   return col;
 }
 
-vec3 shadeTree(vec3 p, vec4 shape, vec3 info, float hAbove, float sh) {
-  float slope = shape.w > 0.5
-    ? info.y / info.z
-    : min(info.y / info.z * 1.2 * shape.z * pow(max(1.0 - shape.z * shape.z, 1e-3), -0.4), 6.0);
-  vec3 n = normalize(vec3(shape.x * slope, 1.0, shape.y * slope));
-  // Leafy clumps: perturb the normal and brightness with fine noise
-  vec3 nb = noised(mod(p.xz * 512.0, PER), PER);
-  n = normalize(n + 0.25 * vec3(nb.y, 0.0, nb.z) / (1.0 + length(nb.yz)));
-  float hf = clamp(hAbove / max(info.y, 1e-5), 0.0, 1.0); // 0 at the base, 1 at the top
-  vec3 col = mix(uTreeCol, uTreeCol2, info.x) * (0.85 + 0.25 * nb.x);
-  if (shape.w > 0.5) col *= 0.82 + 0.18 * sin(hf * 28.0); // conifer tiers
-  return lightIt(col, n, sh, 0.35 + 0.65 * hf);
-}
-
-// Aerial perspective: distance haze plus mist that pools in the valleys
-vec3 applyFog(vec3 col, float t, vec3 ro, vec3 rd) {
-  float hb = 2.2;
-  float base = exp(-max(ro.y, -1.0) * hb);
-  float k = rd.y * hb;
-  float heightTerm = abs(k) < 1e-3 ? base * t : base * (1.0 - exp(-t * k)) / k;
-  float dens = uFogDensity * (0.35 * t + 0.6 * heightTerm);
-  float fo = 1.0 - exp(-dens);
-  fo = max(fo, smoothstep(FAR * 0.65, FAR, t));
-  return mix(col, skyColor(rd), fo);
-}
-
-vec3 aces(vec3 x) {
-  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+// Window depth of a point t along the ray, for the tree camera's perspective projection
+float rayDepth(float t, vec3 rd) {
+  float d = max(t * dot(rd, uCamFwd), uNear);
+  float ndc = (uFar + uNear) / (uFar - uNear) - 2.0 * uFar * uNear / ((uFar - uNear) * d);
+  return clamp(0.5 * ndc + 0.5, 0.0, 1.0);
 }
 
 void main() {
@@ -548,36 +440,19 @@ void main() {
 
   float tWater = rd.y < 0.0 ? (uWater - ro.y) / rd.y : 1e5;
   float tmax = min(FAR, tWater);
-  float onTree;
-  float t = march(ro, rd, tmax, onTree);
+  float t = march(ro, rd, tmax);
   bool lit = dot(uLightCol, vec3(1.0)) > 0.002 && uLightDir.y > -0.05;
 
   vec3 col;
+  float depth = 1.0;
   if (t < tmax) {
     vec3 p = ro + rd * t;
-    vec3 tg = uTreeDensity > 0.0 ? terrainG(p.xz) : vec3(p.y, 0.0, 0.0);
-    float fade = smoothstep(TREE_FAR, TREE_FADE, t);
-    float scale = uTreeSize * fade;
-    float dens = uTreeDensity > 0.0 ? treeDensity(p.xz, tg.x, tg.yz) : 0.0;
-    float tr = 0.0;
-    vec4 shape;
-    vec3 info;
-    if (onTree > 0.5 && scale > 0.0) {
-      float clear;
-      tr = trees(p.xz, dens, scale, clear, shape, info);
-    }
-    float hAbove = max(p.y - tg.x, 0.0);
-    if (tr > 0.0) {
-      float sh = 1.0;
-      if (lit) sh = softShadow(p + vec3(0.0, 0.004, 0.0), uLightDir) * treeShadow(p, hAbove, tg.yz, dens, scale);
-      col = shadeTree(p, shape, info, hAbove, sh);
-    } else {
-      vec3 n = calcNormal(p, t, 10);
-      float sh = 1.0;
-      if (lit && dot(n, uLightDir) > 0.0) sh = softShadow(p + n * 0.004, uLightDir) * treeShadow(p, 0.0, tg.yz, dens, scale);
-      col = shadeTerrain(p, n, rd, sh, dens, fade);
-    }
+    vec3 n = calcNormal(p, t, normalOctaves(t));
+    float sh = 1.0;
+    if (lit && dot(n, uLightDir) > 0.0) sh = softShadow(p + n * 0.004, uLightDir);
+    col = shadeTerrain(p, n, rd, sh);
     col = applyFog(col, t, ro, rd);
+    depth = rayDepth(t, rd);
   } else if (tWater < FAR) {
     vec3 p = ro + rd * tWater;
     // Two drifting octaves of ripples; flatten with distance to avoid shimmer
@@ -593,37 +468,191 @@ void main() {
     float tr = marchRefl(p + vec3(0.0, 0.002, 0.0), rr, 8.0);
     if (tr < 8.0) {
       vec3 q = p + rr * tr;
-      vec3 nq = calcNormal(q, tr + tWater, 6);
-      // Reflected forests use the canopy texture, not 3D trees. The slope comes from the
-      // normal, scaled down to match terrainG's gradient estimate.
-      float dq = uTreeDensity > 0.0 ? treeDensity(q.xz, q.y, -0.4 * nq.xz / max(nq.y, 0.2)) : 0.0;
-      refl = shadeTerrain(q, nq, rr, 1.0, dq, 0.0);
+      vec3 nq = calcNormal(q, tr + tWater, 6.0);
+      refl = shadeTerrain(q, nq, rr, 1.0);
       refl = applyFog(refl, tr, p, rr);
     } else {
       refl = skyFull(rr);
     }
 
     float sh = lit ? softShadow(p + vec3(0.0, 0.004, 0.0), uLightDir) : 0.0;
-    float depth = uWater - terrain(p.xz, 4);
+    float wd = uWater - terrain(p.xz, 4);
     vec3 body = uWaterCol * (uAmbient * 0.8 + uLightCol * (0.3 + 0.5 * sh) * max(uLightDir.y, 0.0));
     vec3 shallow = uSand * (uAmbient * 0.7 + uLightCol * sh * max(uLightDir.y, 0.0) * 1.6) * 0.6;
-    body = mix(shallow, body, smoothstep(0.0, 0.06, depth));
+    body = mix(shallow, body, smoothstep(0.0, 0.06, wd));
     col = mix(body, refl, fres);
     col += uLightCol * 3.0 * pow(max(dot(rr, uLightDir), 0.0), 350.0) * sh;
     // A thin bright lip where water meets the shore
-    float foam = smoothstep(0.012, 0.0, depth) * (0.6 + 0.4 * w2.x);
+    float foam = smoothstep(0.012, 0.0, wd) * (0.6 + 0.4 * w2.x);
     col = mix(col, (uAmbient + uLightCol * sh) * 0.7, foam * 0.5);
     col = applyFog(col, tWater, ro, rd);
+    depth = rayDepth(tWater, rd);
   } else {
     col = skyFull(rd);
   }
 
-  col = aces(col * 1.1);
-  col = pow(col, vec3(1.0 / 2.2));
-  // Dither before the 8-bit render target to keep dusk gradients from banding
-  float dn = hash01(mod(gl_FragCoord.xy, 4096.0));
-  col += (dn - 0.5) / 255.0;
-  gl_FragColor = vec4(col, 1.0);
+  gl_FragColor = vec4(finish(col), 1.0);
+  gl_FragDepth = depth;
+}
+`
+
+// How big a tree instance is drawn right now (0 = hidden), from its stored suitability and
+// the current biome: density, water level, snow line and conifer share all blend smoothly,
+// so trees grow and shrink with a biome change instead of popping. Far away only a thinned
+// subset remains (drawn a little larger to keep the forest's coverage), and everything
+// shrinks away toward the edge of the forest radius. Mirrors Forest.rebuild's bounds.
+const TREE_SCALE_GLSL = /* glsl */ `
+attribute vec4 aTint; // suitability, growth threshold, conifer rank, color mix
+attribute vec4 aMisc; // crown aspect, ground slope x / z, thinning rank
+uniform float uWater;
+uniform float uSnowLine;
+uniform float uTreeDensity;
+uniform float uTreeSize;
+uniform float uConifer;
+uniform float uThinDistance;
+uniform float uFadeStart;
+uniform float uRadius;
+
+float treeScale(vec3 base, float conifer) {
+  float aw = base.y - uWater;
+  float dens = uTreeDensity * aTint.x
+             * smoothstep(0.025, 0.07, aw)
+             * (1.0 - smoothstep(0.55, 0.95, aw))
+             * (1.0 - smoothstep(uSnowLine - 0.25, uSnowLine - 0.03, base.y));
+  float grow = clamp((dens - aTint.y) * 6.0, 0.0, 1.0);
+  float con = smoothstep(aTint.z - 0.06, aTint.z + 0.06, uConifer * 1.12 - 0.06);
+  float species = conifer > 0.5 ? con : 1.0 - con;
+  float d = length(base.xz - cameraPosition.xz);
+  float keep = min(1.0, uThinDistance / max(d, 1e-3));
+  float thin = clamp((keep - aMisc.w) / 0.06, 0.0, 1.0);
+  float enlarge = min(inversesqrt(keep), 1.8);
+  float edge = 1.0 - smoothstep(uFadeStart, uRadius, d);
+  return grow * species * thin * edge * enlarge * uTreeSize;
+}
+`
+
+const TREE_VERT = /* glsl */ `
+${TREE_SCALE_GLSL}
+attribute float aLeaf; // 1 foliage, 0 trunk
+attribute float aAo; // baked occlusion: dark low and inside the crown
+uniform float uSpecies; // 1 for the conifer mesh, 0 for the broadleaf mesh
+uniform vec3 uColA;
+uniform vec3 uColB;
+uniform vec3 uTrunk;
+varying vec3 vWorld;
+varying vec3 vNormal;
+varying vec3 vColor;
+varying float vAo;
+varying float vLeaf;
+
+void main() {
+  vec3 base = instanceMatrix[3].xyz;
+  float k = treeScale(base, uSpecies);
+  if (k < 0.003) {
+    // Hidden (wrong species here, not grown, or thinned out): outside the clip volume
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+    return;
+  }
+  float asp = 0.85 + 0.3 * aMisc.x;
+  vec4 wp = modelMatrix * instanceMatrix * vec4(position * vec3(asp, 1.0, asp) * k, 1.0);
+  vWorld = wp.xyz;
+  vNormal = normalize(mat3(modelMatrix) * mat3(instanceMatrix) * (normal * vec3(1.0 / asp, 1.0, 1.0 / asp)));
+  float shade = 0.82 + 0.36 * fract(aTint.w * 13.7);
+  vColor = mix(uTrunk, mix(uColA, uColB, aTint.w) * shade, aLeaf);
+  vAo = aAo;
+  vLeaf = aLeaf;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+}
+`
+
+// Trees use the landscape's own light model: the sun/moon key light with terrain shadows
+// (a directional light), sky ambient weighted by the normal's upward tilt (a hemisphere
+// light), the same bounce, fog and tonemap. Leaves wrap light a little and glow when the
+// sun is behind them.
+const TREE_FRAG = /* glsl */ `
+${COMMON_GLSL}
+uniform float uSpecies;
+varying vec3 vWorld;
+varying vec3 vNormal;
+varying vec3 vColor;
+varying float vAo;
+varying float vLeaf;
+
+void main() {
+  vec3 n = normalize(vNormal);
+  vec3 toP = vWorld - cameraPosition;
+  float t = length(toP);
+  vec3 rd = toP / t;
+  vec3 L = uLightDir;
+  vec3 wp = vec3(vWorld.x + uOriginW.x, vWorld.y, vWorld.z + uOriginW.y);
+  bool lit = dot(uLightCol, vec3(1.0)) > 0.002 && L.y > -0.05;
+  float sh = lit ? softShadow(wp + vec3(0.0, 0.003, 0.0), L) : 0.0;
+  float nl = dot(n, L);
+  float dif = clamp(mix(nl, (nl + 0.5) / 1.5, vLeaf), 0.0, 1.0) * sh * mix(1.0, vAo, 0.5);
+  float amb = (0.55 + 0.45 * n.y) * vAo;
+  float bou = clamp(0.5 - 0.5 * dot(n, normalize(vec3(L.x, 0.0, L.z) + 1e-4)), 0.0, 1.0) * (1.0 - 0.5 * n.y);
+  vec3 col = vColor * (uLightCol * dif * 2.2 + uAmbient * amb + uLightCol * 0.12 * bou * vAo);
+  float back = pow(clamp(dot(rd, L), 0.0, 1.0), 5.0) * vLeaf * sh;
+  col += vColor * uLightCol * back * mix(0.9, 0.35, uSpecies);
+  col = applyFog(col, t, uCamPos, rd);
+  gl_FragColor = vec4(finish(col), 1.0);
+}
+`
+
+// Each tree's shadow on the ground: a soft ellipse laid on the local ground slope, cast
+// away from the light and stretched as the sun gets low. Multiplied onto the frame.
+const SHADOW_VERT = /* glsl */ `
+${TREE_SCALE_GLSL}
+uniform vec3 uLightDir;
+uniform float uShadowStrength;
+varying vec2 vQ;
+varying vec3 vWorld;
+
+void main() {
+  vec3 base = instanceMatrix[3].xyz;
+  float k = treeScale(base, 0.0) + treeScale(base, 1.0);
+  if (k < 0.003 || uShadowStrength <= 0.0) {
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+    return;
+  }
+  float h = length(instanceMatrix[1].xyz) * k;
+  float r = h * 0.32 * (0.85 + 0.3 * aMisc.x);
+  vec2 lh = uLightDir.xz;
+  float ll = length(lh);
+  vec2 dir = ll > 1e-4 ? -lh / ll : vec2(1.0, 0.0);
+  float cotE = min(ll / max(uLightDir.y, 0.05), 4.0);
+  // The crown (from about 0.3 h up) throws its shadow from c0 to c1 along dir
+  float c0 = 0.3 * h * cotE;
+  float c1 = h * cotE;
+  float mid = 0.5 * (c0 + c1);
+  float hl = 0.5 * (c1 - c0) + r;
+  vec2 side = vec2(-dir.y, dir.x);
+  vec2 off = dir * (mid + position.x * hl) + side * (position.y * r);
+  float d = length(base.xz - cameraPosition.xz);
+  float y = base.y + 0.0027 + 0.0003 * d + dot(aMisc.yz, off);
+  vec3 wp = vec3(base.x + off.x, y, base.z + off.y);
+  vQ = position.xy;
+  vWorld = wp;
+  gl_Position = projectionMatrix * viewMatrix * vec4(wp, 1.0);
+}
+`
+
+const SHADOW_FRAG = /* glsl */ `
+${COMMON_GLSL}
+uniform float uShadowStrength;
+varying vec2 vQ;
+varying vec3 vWorld;
+
+void main() {
+  float m = 1.0 - smoothstep(0.3, 1.0, dot(vQ, vQ));
+  vec3 toP = vWorld - cameraPosition;
+  float t = length(toP);
+  float fo = fogAmount(t, uCamPos, toP / t);
+  // No double darkening where the ground is already in a hill's shadow
+  vec3 wp = vec3(vWorld.x + uOriginW.x, vWorld.y, vWorld.z + uOriginW.y);
+  float sh = softShadow(wp + vec3(0.0, 0.003, 0.0), uLightDir);
+  float s = uShadowStrength * m * (1.0 - fo) * sh;
+  gl_FragColor = vec4(vec3(1.0 - s), 1.0);
 }
 `
 
@@ -645,6 +674,7 @@ const smoothstep = (a: number, b: number, x: number) => {
   return t * t * (3 - 2 * t)
 }
 const rand = (a: number, b: number) => a + Math.random() * (b - a)
+const fract = (x: number) => x - Math.floor(x)
 
 const toColors = (hexes: string[]) => hexes.map(h => new THREE.Color(h))
 const DAWN_COLORS = { zenith: toColors(DAWN.zenith), horizon: toColors(DAWN.horizon), glow: toColors(DAWN.glow) }
@@ -669,6 +699,103 @@ const randomStyle = (): FlightStyle => ({
   cloudCover: rand(0, 0.85),
 })
 
+// ---------------------------------------------------------------- tree models
+// Unit-height models (base at y = 0, top at y <= 1); instances scale them to the tree's
+// height and stretch the crown width by a per-tree aspect. Low-poly, but with smoothed,
+// crown-shaped normals and baked occlusion so they shade like foliage rather than facets.
+
+// Tags a part with the per-vertex attributes the tree shader expects
+function tagPart(g: THREE.BufferGeometry, leaf: number, ao: (x: number, y: number, z: number) => number) {
+  g.deleteAttribute('uv')
+  const pos = g.getAttribute('position')
+  const leafArr = new Float32Array(pos.count).fill(leaf)
+  const aoArr = new Float32Array(pos.count)
+  for (let i = 0; i < pos.count; i++) aoArr[i] = ao(pos.getX(i), pos.getY(i), pos.getZ(i))
+  g.setAttribute('aLeaf', new THREE.BufferAttribute(leafArr, 1))
+  g.setAttribute('aAo', new THREE.BufferAttribute(aoArr, 1))
+  return g
+}
+
+// A spruce: three stacked, slightly ragged cones on a short trunk
+function buildConifer() {
+  const parts: THREE.BufferGeometry[] = []
+  const trunk = new THREE.CylinderGeometry(0.03, 0.05, 0.4, 5, 1, true)
+  trunk.translate(0, 0.15, 0)
+  parts.push(tagPart(trunk, 0, () => 0.45))
+  const tiers = [
+    { y0: 0.12, y1: 0.62, r: 0.34 },
+    { y0: 0.34, y1: 0.84, r: 0.27 },
+    { y0: 0.56, y1: 1.0, r: 0.19 },
+  ]
+  tiers.forEach((tier, k) => {
+    const h = tier.y1 - tier.y0
+    const cone = new THREE.ConeGeometry(tier.r, h, 7, 1, true)
+    cone.rotateY(k * 0.9)
+    cone.translate(0, tier.y0 + h / 2, 0)
+    // Ragged skirt: the rim droops unevenly
+    const pos = cone.getAttribute('position')
+    for (let i = 0; i < pos.count; i++) {
+      if (pos.getY(i) < tier.y0 + 0.01) pos.setY(i, pos.getY(i) - 0.04 * fract(Math.sin(i * 12.9898 + k * 78.233) * 43758.5453))
+    }
+    cone.computeVertexNormals()
+    parts.push(tagPart(cone, 1, (_x, y) => (0.35 + 0.65 * smoothstep(tier.y0 - 0.05, tier.y1, y)) * (0.75 + 0.125 * k)))
+  })
+  const g = mergeGeometries(parts)
+  parts.forEach(p => p.dispose())
+  return g
+}
+
+// A broadleaf: a lumpy crown of a few merged blobs on a taller trunk. The normals blend each
+// blob's own with the direction from the crown's centre, so the crown shades as one mass.
+function buildBroadleaf() {
+  const parts: THREE.BufferGeometry[] = []
+  const trunk = new THREE.CylinderGeometry(0.03, 0.05, 0.55, 5, 1, true)
+  trunk.translate(0, 0.225, 0)
+  parts.push(tagPart(trunk, 0, () => 0.4))
+  const crown = new THREE.Vector3(0, 0.62, 0)
+  const blobs = [
+    { c: [0, 0.64, 0], r: 0.34 },
+    { c: [0.2, 0.52, 0.12], r: 0.24 },
+    { c: [-0.17, 0.55, -0.15], r: 0.23 },
+    { c: [-0.04, 0.48, 0.22], r: 0.21 },
+    { c: [0.06, 0.8, -0.04], r: 0.2 },
+  ]
+  const v = new THREE.Vector3()
+  const nb = new THREE.Vector3()
+  const nc = new THREE.Vector3()
+  blobs.forEach((b, k) => {
+    let g: THREE.BufferGeometry = new THREE.IcosahedronGeometry(1, 0)
+    g.deleteAttribute('normal')
+    g.deleteAttribute('uv')
+    g = mergeVertices(g)
+    const pos = g.getAttribute('position')
+    const nrm = new Float32Array(pos.count * 3)
+    for (let i = 0; i < pos.count; i++) {
+      v.set(pos.getX(i), pos.getY(i), pos.getZ(i))
+      nb.copy(v).normalize()
+      // Lumpy silhouette: push each vertex in or out a little
+      const j = 1 + 0.14 * (fract(Math.sin(i * 91.7 + k * 37.1) * 43758.5453) - 0.5)
+      v.multiplyScalar(b.r * j)
+      v.y *= 0.85
+      v.add(nc.set(b.c[0], b.c[1], b.c[2]))
+      pos.setXYZ(i, v.x, v.y, v.z)
+      nc.copy(v).sub(crown).normalize()
+      nb.lerp(nc, 0.55).normalize()
+      nrm[i * 3] = nb.x
+      nrm[i * 3 + 1] = nb.y
+      nrm[i * 3 + 2] = nb.z
+    }
+    g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3))
+    parts.push(tagPart(g, 1, (x, y, z) => {
+      const out = Math.min(1, Math.hypot(x - crown.x, (y - crown.y) * 1.2, z - crown.z) / 0.42)
+      return (0.3 + 0.7 * smoothstep(0.3, 0.95, y)) * (0.6 + 0.4 * out)
+    }))
+  })
+  const g = mergeGeometries(parts)
+  parts.forEach(p => p.dispose())
+  return g
+}
+
 export default function TerrainFlight() {
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -680,9 +807,11 @@ export default function TerrainFlight() {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     renderer.setSize(window.innerWidth, window.innerHeight)
     renderer.setClearColor(SKY_CLEAR_COLOR)
+    renderer.autoClear = false // the landscape and the trees share one color + depth target
     container.appendChild(renderer.domElement)
 
-    // The raymarch renders into a small target that the blit pass stretches to the screen
+    // The raymarch and the trees render into a small multisampled target that the blit
+    // pass stretches to the screen
     let renderScale = RENDER_SCALE
     const targetSize = () => {
       const pixels = window.innerWidth * window.innerHeight * renderScale * renderScale
@@ -696,11 +825,23 @@ export default function TerrainFlight() {
     const target = new THREE.WebGLRenderTarget(w0, h0, {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
-      depthBuffer: false,
+      depthBuffer: true,
+      samples: MSAA_SAMPLES,
     })
+    // Depth is only needed while drawing; skip copying it out of the multisampled buffer
+    target.resolveDepthBuffer = false
 
     const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
     const quad = new THREE.PlaneGeometry(2, 2)
+
+    // Rasterized trees are seen through a perspective camera that matches the raymarch
+    // camera exactly: same position, basis, vertical field of view and aspect
+    const fovDeg = THREE.MathUtils.radToDeg(2 * Math.atan(TAN_HALF_FOV))
+    const treeCamera = new THREE.PerspectiveCamera(fovDeg, w0 / h0, CAMERA_NEAR, CAMERA_FAR)
+    // A wider twin, only for choosing which forest tiles go into the instance buffers
+    const cullCamera = new THREE.PerspectiveCamera(
+      THREE.MathUtils.radToDeg(2 * Math.atan(TAN_HALF_FOV * CULL_FOV_MARGIN)),
+      (w0 / h0) * CULL_ASPECT_MARGIN, CAMERA_NEAR, CAMERA_FAR)
 
     const uniforms = {
       uResolution: { value: new THREE.Vector2(w0, h0) },
@@ -710,6 +851,9 @@ export default function TerrainFlight() {
       uCamUp: { value: new THREE.Vector3() },
       uCamFwd: { value: new THREE.Vector3() },
       uTanHalfFov: { value: TAN_HALF_FOV },
+      uNear: { value: CAMERA_NEAR },
+      uFar: { value: CAMERA_FAR },
+      uOriginW: { value: new THREE.Vector2() },
       uSunDir: { value: new THREE.Vector3() },
       uMoonDir: { value: new THREE.Vector3() },
       uLightDir: { value: new THREE.Vector3() },
@@ -732,18 +876,24 @@ export default function TerrainFlight() {
       uWaterCol: { value: new THREE.Color() },
       uSnowLine: { value: 0.4 },
       uStrata: { value: 0 },
-      uTreeCol: { value: new THREE.Color() },
-      uTreeCol2: { value: new THREE.Color() },
+      // Trees
       uTreeDensity: { value: 0 },
       uTreeSize: { value: 1 },
       uConifer: { value: 0.5 },
+      uThinDistance: { value: TREE_THIN_DISTANCE },
+      uFadeStart: { value: TREE_FADE_START },
+      uRadius: { value: TREE_RADIUS },
+      uTrunk: { value: new THREE.Color(TRUNK_COLOR) },
+      uShadowStrength: { value: 0 },
     }
     const terrainMaterial = new THREE.ShaderMaterial({
       vertexShader: QUAD_VERT,
       fragmentShader: TERRAIN_FRAG,
       uniforms,
-      depthTest: false,
-      depthWrite: false,
+      // Depth comes from the ray hit (gl_FragDepth); the test must be on for it to be written
+      depthTest: true,
+      depthWrite: true,
+      depthFunc: THREE.AlwaysDepth,
     })
     const blitMaterial = new THREE.ShaderMaterial({
       vertexShader: QUAD_VERT,
@@ -752,10 +902,70 @@ export default function TerrainFlight() {
       depthTest: false,
       depthWrite: false,
     })
-    const terrainScene = new THREE.Scene()
-    terrainScene.add(new THREE.Mesh(quad, terrainMaterial))
+    // The landscape quad is drawn first in the same scene (and the same render call) as the
+    // trees: three.js discards a multisampled target's color after each render() into it
+    const terrainQuad = new THREE.Mesh(quad, terrainMaterial)
+    terrainQuad.frustumCulled = false
+    terrainQuad.renderOrder = -1
     const blitScene = new THREE.Scene()
     blitScene.add(new THREE.Mesh(quad, blitMaterial))
+
+    // ---- trees: two instanced meshes (conifer, broadleaf) and their ground shadows, all
+    // drawing the same instance buffers; each instance shows as one species or the other
+    const coniferGeometry = buildConifer()
+    const broadleafGeometry = buildBroadleaf()
+    const shadowGeometry = new THREE.PlaneGeometry(2, 2)
+    const tintAttr = new THREE.InstancedBufferAttribute(new Float32Array(MAX_TREES * 4), 4)
+    const miscAttr = new THREE.InstancedBufferAttribute(new Float32Array(MAX_TREES * 4), 4)
+    tintAttr.setUsage(THREE.DynamicDrawUsage)
+    miscAttr.setUsage(THREE.DynamicDrawUsage)
+    for (const g of [coniferGeometry, broadleafGeometry, shadowGeometry]) {
+      g.setAttribute('aTint', tintAttr)
+      g.setAttribute('aMisc', miscAttr)
+    }
+    const treeMaterial = (species: number) => new THREE.ShaderMaterial({
+      vertexShader: TREE_VERT,
+      fragmentShader: TREE_FRAG,
+      uniforms: {
+        ...uniforms,
+        uSpecies: { value: species },
+        uColA: { value: new THREE.Color() },
+        uColB: { value: new THREE.Color() },
+      },
+    })
+    const coniferMaterial = treeMaterial(1)
+    const broadleafMaterial = treeMaterial(0)
+    const shadowMaterial = new THREE.ShaderMaterial({
+      vertexShader: SHADOW_VERT,
+      fragmentShader: SHADOW_FRAG,
+      uniforms,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      // frame color *= shadow color
+      blending: THREE.CustomBlending,
+      blendEquation: THREE.AddEquation,
+      blendSrc: THREE.ZeroFactor,
+      blendDst: THREE.SrcColorFactor,
+    })
+    const conifers = new THREE.InstancedMesh(coniferGeometry, coniferMaterial, MAX_TREES)
+    const broadleaves = new THREE.InstancedMesh(broadleafGeometry, broadleafMaterial, MAX_TREES)
+    const shadows = new THREE.InstancedMesh(shadowGeometry, shadowMaterial, MAX_TREES)
+    const instanceMatrix = conifers.instanceMatrix
+    instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+    broadleaves.instanceMatrix = instanceMatrix
+    shadows.instanceMatrix = instanceMatrix
+    const scene = new THREE.Scene()
+    scene.add(terrainQuad)
+    // Landscape first, then tree shadows (they only darken the ground), then the trees
+    shadows.renderOrder = 0
+    conifers.renderOrder = 1
+    broadleaves.renderOrder = 1
+    for (const m of [shadows, conifers, broadleaves]) {
+      m.count = 0
+      m.visible = false
+      m.frustumCulled = false // the forest manager already culls by tile
+      scene.add(m)
+    }
 
     // ---- biome + flight style, re-randomized periodically with a smooth crossfade
     interface Look {
@@ -766,11 +976,13 @@ export default function TerrainFlight() {
       snowLine: number
       strata: number
       waterLevel: number
-      tree: THREE.Color
-      tree2: THREE.Color
+      conA: THREE.Color
+      conB: THREE.Color
+      leafA: THREE.Color
+      leafB: THREE.Color
       treeDensity: number
       treeSize: number
-      conifer: number
+      coniferShare: number
       style: FlightStyle
     }
     const lookFromBiome = (b: Biome, style: FlightStyle): Look => ({
@@ -781,17 +993,31 @@ export default function TerrainFlight() {
       snowLine: b.snowLine,
       strata: b.strata,
       waterLevel: b.waterLevel,
-      tree: new THREE.Color(b.tree),
-      tree2: new THREE.Color(b.tree2),
+      conA: new THREE.Color(b.conifer[0]),
+      conB: new THREE.Color(b.conifer[1]),
+      leafA: new THREE.Color(b.leaf[0]),
+      leafB: new THREE.Color(b.leaf[1]),
       treeDensity: b.treeDensity,
       treeSize: b.treeSize,
-      conifer: b.conifer,
+      coniferShare: b.coniferShare,
       style,
+    })
+    const cloneLook = (l: Look): Look => ({
+      ...l,
+      grass: l.grass.clone(),
+      rock: l.rock.clone(),
+      sand: l.sand.clone(),
+      water: l.water.clone(),
+      conA: l.conA.clone(),
+      conB: l.conB.clone(),
+      leafA: l.leafA.clone(),
+      leafB: l.leafB.clone(),
+      style: { ...l.style },
     })
     let biomeIndex = Math.floor(Math.random() * BIOMES.length)
     let fromLook = lookFromBiome(BIOMES[biomeIndex], randomStyle())
     let toLook = fromLook
-    const look: Look = lookFromBiome(BIOMES[biomeIndex], { ...fromLook.style })
+    const look: Look = cloneLook(fromLook)
     let blendStart = -Infinity
     let nextBiomeAt = rand(BIOME_MIN_SECONDS, BIOME_MAX_SECONDS)
 
@@ -800,19 +1026,14 @@ export default function TerrainFlight() {
       if (next >= biomeIndex) next++
       biomeIndex = next
       // Start from wherever the current blend has got to, so nothing ever jumps
-      fromLook = {
-        ...look,
-        grass: look.grass.clone(),
-        rock: look.rock.clone(),
-        sand: look.sand.clone(),
-        water: look.water.clone(),
-        tree: look.tree.clone(),
-        tree2: look.tree2.clone(),
-        style: { ...look.style },
-      }
+      fromLook = cloneLook(look)
       toLook = lookFromBiome(BIOMES[next], randomStyle())
       blendStart = now
     }
+
+    // Snow lines of "no snow" biomes are huge; blend in a clamped range so snow recedes over
+    // the whole blend instead of vanishing in the first second
+    const snowOf = (l: Look) => Math.min(l.snowLine, 1.6)
 
     const updateLook = (now: number) => {
       const k = smoothstep(0, 1, (now - blendStart) / BIOME_BLEND_SECONDS)
@@ -821,14 +1042,14 @@ export default function TerrainFlight() {
       look.rock.copy(fromLook.rock).lerp(toLook.rock, k)
       look.sand.copy(fromLook.sand).lerp(toLook.sand, k)
       look.water.copy(fromLook.water).lerp(toLook.water, k)
-      look.tree.copy(fromLook.tree).lerp(toLook.tree, k)
-      look.tree2.copy(fromLook.tree2).lerp(toLook.tree2, k)
+      look.conA.copy(fromLook.conA).lerp(toLook.conA, k)
+      look.conB.copy(fromLook.conB).lerp(toLook.conB, k)
+      look.leafA.copy(fromLook.leafA).lerp(toLook.leafA, k)
+      look.leafB.copy(fromLook.leafB).lerp(toLook.leafB, k)
       look.treeDensity = lerp(fromLook.treeDensity, toLook.treeDensity)
       look.treeSize = lerp(fromLook.treeSize, toLook.treeSize)
-      look.conifer = lerp(fromLook.conifer, toLook.conifer)
-      // Snow lines of "no snow" biomes are huge; blend in a clamped range so snow
-      // recedes over the whole blend instead of vanishing in the first second
-      look.snowLine = lerp(Math.min(fromLook.snowLine, 1.6), Math.min(toLook.snowLine, 1.6))
+      look.coniferShare = lerp(fromLook.coniferShare, toLook.coniferShare)
+      look.snowLine = lerp(snowOf(fromLook), snowOf(toLook))
       look.strata = lerp(fromLook.strata, toLook.strata)
       look.waterLevel = lerp(fromLook.waterLevel, toLook.waterLevel)
       look.style.clearance = lerp(fromLook.style.clearance, toLook.style.clearance)
@@ -852,6 +1073,46 @@ export default function TerrainFlight() {
       flightParams(),
     )
 
+    // ---- forest. Trees live in unwrapped world coordinates that follow the camera
+    // continuously across the terrain's wrap, relative to a floating origin near the camera
+    // (keeps float32 vertex positions precise however long it runs).
+    const forest = new Forest()
+    let camUX = flight.x
+    let camUZ = flight.z
+    let prevFlightX = flight.x
+    let prevFlightZ = flight.z
+    forest.recenter(camUX, camUZ)
+    const frustum = new THREE.Frustum()
+    const cullMatrix = new THREE.Matrix4()
+    const box = new THREE.Box3()
+    const inView = (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number) =>
+      frustum.intersectsBox(box.set(box.min.set(x0, y0, z0), box.max.set(x1, y1, z1)))
+    const forestBounds: ForestBounds = { density: 0, waterMin: 0, snowMax: 0 }
+    let rebuildTimer = 0
+    const rebuildForest = () => {
+      cullCamera.position.copy(treeCamera.position)
+      cullCamera.quaternion.copy(treeCamera.quaternion)
+      cullCamera.updateMatrixWorld()
+      frustum.setFromProjectionMatrix(cullMatrix.multiplyMatrices(cullCamera.projectionMatrix, cullCamera.matrixWorldInverse))
+      // Anything the biome blend could reach before the next rebuild
+      forestBounds.density = Math.max(look.treeDensity, fromLook.treeDensity, toLook.treeDensity)
+      forestBounds.waterMin = Math.min(look.waterLevel, fromLook.waterLevel, toLook.waterLevel)
+      forestBounds.snowMax = Math.max(look.snowLine, snowOf(fromLook), snowOf(toLook))
+      const n = forest.rebuild(inView, forestBounds,
+        instanceMatrix.array as Float32Array, tintAttr.array as Float32Array, miscAttr.array as Float32Array, MAX_TREES)
+      for (const m of [shadows, conifers, broadleaves]) {
+        m.count = n
+        m.visible = n > 0
+      }
+      // Upload only the part in use
+      for (const [attr, size] of [[instanceMatrix, 16], [tintAttr, 4], [miscAttr, 4]] as const) {
+        attr.clearUpdateRanges()
+        attr.addUpdateRange(0, Math.max(n, 1) * size)
+        attr.needsUpdate = true
+      }
+      uniforms.uOriginW.value.set(mod(forest.originX, PERIOD), mod(forest.originZ, PERIOD))
+    }
+
     // Day phase: 0 = sunrise, pi/2 = noon, pi = sunset. Start somewhere in the morning.
     let dayPhase = rand(-0.2, 0.9)
     let starAngle = rand(0, 6.28)
@@ -864,9 +1125,12 @@ export default function TerrainFlight() {
     const fwd = new THREE.Vector3()
     const right0 = new THREE.Vector3()
     const up0 = new THREE.Vector3()
+    const back = new THREE.Vector3()
+    const basis = new THREE.Matrix4()
     const tmpColor = new THREE.Color()
     const moonLight = new THREE.Color(MOONLIGHT)
     const nightAmbient = new THREE.Color(NIGHT_AMBIENT)
+    const luminance = (c: THREE.Color) => 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
 
     const updateSky = () => {
       const sp = Math.sin(dayPhase)
@@ -901,6 +1165,12 @@ export default function TerrainFlight() {
       }
       uniforms.uAmbient.value.copy(zen).lerp(hor, 0.35).multiplyScalar(0.55).add(nightAmbient)
       uniforms.uNight.value = 1 - smoothstep(-0.22, -0.02, elevation)
+
+      // Tree shadows are as deep as the key light's share of the light on open ground
+      const L = uniforms.uLightDir.value
+      const direct = 2.2 * luminance(uniforms.uLightCol.value) * Math.max(L.y, 0)
+      const ambient = luminance(uniforms.uAmbient.value)
+      uniforms.uShadowStrength.value = L.y > 0.02 ? 0.8 * direct / (direct + ambient + 1e-4) : 0
       return elevation
     }
 
@@ -921,6 +1191,20 @@ export default function TerrainFlight() {
       uniforms.uCamUp.value.copy(up0).multiplyScalar(cr).addScaledVector(right0, sr)
       uniforms.uCamRight.value.copy(right0).multiplyScalar(cr).addScaledVector(up0, -sr)
       uniforms.uCamPos.value.set(flight.x, flight.y, flight.z)
+
+      // Unwrapped camera track (flight.x/z wrap mod PERIOD)
+      const wrapDelta = (d: number) => d - PERIOD * Math.round(d / PERIOD)
+      camUX += wrapDelta(flight.x - prevFlightX)
+      camUZ += wrapDelta(flight.z - prevFlightZ)
+      prevFlightX = flight.x
+      prevFlightZ = flight.z
+
+      // The tree camera: same eye and basis (x right, y up, looking down -z = forward)
+      treeCamera.position.set(camUX - forest.originX, flight.y, camUZ - forest.originZ)
+      back.copy(fwd).negate()
+      basis.makeBasis(uniforms.uCamRight.value, uniforms.uCamUp.value, back)
+      treeCamera.quaternion.setFromRotationMatrix(basis)
+      treeCamera.updateMatrixWorld()
     }
 
     const handleResize = () => {
@@ -928,6 +1212,10 @@ export default function TerrainFlight() {
       const [w, h] = targetSize()
       target.setSize(w, h)
       uniforms.uResolution.value.set(w, h)
+      treeCamera.aspect = w / h
+      treeCamera.updateProjectionMatrix()
+      cullCamera.aspect = (w / h) * CULL_ASPECT_MARGIN
+      cullCamera.updateProjectionMatrix()
     }
     window.addEventListener('resize', handleResize)
 
@@ -939,6 +1227,7 @@ export default function TerrainFlight() {
     const startTime = performance.now()
     let lastTime = startTime
     let animationId = 0
+    let firstFrame = true
 
     const animate = () => {
       animationId = requestAnimationFrame(animate)
@@ -949,7 +1238,7 @@ export default function TerrainFlight() {
       const dt = Math.min(rawDt, 1 / 20)
       const time = (now - startTime) / 1000
 
-      if (rawDt < 0.1) {
+      if (rawDt < 0.1 && !firstFrame) {
         slowSum += rawDt
         slowCount++
         if (slowCount >= 120) {
@@ -976,6 +1265,21 @@ export default function TerrainFlight() {
 
       updateCamera(dt, time)
 
+      // Forest: populate nearby tiles (the first frame does most of the view at once), and
+      // periodically rewrite the visible instance list
+      const recentered = forest.recenter(camUX, camUZ)
+      if (recentered) {
+        treeCamera.position.set(camUX - forest.originX, flight.y, camUZ - forest.originZ)
+        treeCamera.updateMatrixWorld()
+      }
+      forest.update(camUX, camUZ, fwd.x, fwd.z, firstFrame ? FOREST_STARTUP_MS : FOREST_BUDGET_MS)
+      rebuildTimer -= dt
+      if (rebuildTimer <= 0 || recentered || firstFrame) {
+        rebuildTimer = FOREST_REBUILD_SECONDS
+        rebuildForest()
+      }
+      firstFrame = false
+
       const windX = Math.cos(windAngle)
       const windZ = Math.sin(windAngle)
       cloudOffset.set(mod(cloudOffset.x + windX * 0.02 * dt, PERIOD), mod(cloudOffset.y + windZ * 0.02 * dt, PERIOD))
@@ -996,14 +1300,17 @@ export default function TerrainFlight() {
       uniforms.uWaterCol.value.copy(look.water)
       uniforms.uSnowLine.value = look.snowLine
       uniforms.uStrata.value = look.strata
-      uniforms.uTreeCol.value.copy(look.tree)
-      uniforms.uTreeCol2.value.copy(look.tree2)
       uniforms.uTreeDensity.value = look.treeDensity
       uniforms.uTreeSize.value = look.treeSize
-      uniforms.uConifer.value = look.conifer
+      uniforms.uConifer.value = look.coniferShare
+      coniferMaterial.uniforms.uColA.value.copy(look.conA)
+      coniferMaterial.uniforms.uColB.value.copy(look.conB)
+      broadleafMaterial.uniforms.uColA.value.copy(look.leafA)
+      broadleafMaterial.uniforms.uColB.value.copy(look.leafB)
 
       renderer.setRenderTarget(target)
-      renderer.render(terrainScene, camera)
+      renderer.clear(true, true, false)
+      renderer.render(scene, treeCamera)
       renderer.setRenderTarget(null)
       renderer.render(blitScene, camera)
     }
@@ -1016,6 +1323,15 @@ export default function TerrainFlight() {
       quad.dispose()
       terrainMaterial.dispose()
       blitMaterial.dispose()
+      coniferGeometry.dispose()
+      broadleafGeometry.dispose()
+      shadowGeometry.dispose()
+      coniferMaterial.dispose()
+      broadleafMaterial.dispose()
+      shadowMaterial.dispose()
+      conifers.dispose()
+      broadleaves.dispose()
+      shadows.dispose()
       target.dispose()
       renderer.dispose()
       container.removeChild(renderer.domElement)

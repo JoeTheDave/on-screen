@@ -1,6 +1,8 @@
 // CPU twin of the GLSL terrain() in TerrainFlight.tsx, plus the camera's flight controller
-// (which uses it to look ahead and steer around the high ground). It has to match the shader closely (it does, apart
-// from float32/float64 rounding), so every constant here mirrors one in the shader.
+// (which uses it to look ahead and steer around the high ground) and the forest placement
+// (trees are real instanced models standing on this surface). It has to match the shader
+// closely (it does, apart from float32/float64 rounding), so every constant here mirrors one
+// in the shader.
 //
 // The landscape is periodic with period PERIOD in x and z. Each fbm octave stays periodic
 // by using an integer "rotate and scale" matrix [[2,-1],[1,2]] (lacunarity sqrt(5), about
@@ -97,7 +99,7 @@ export function terrainHeight(x: number, z: number, octaves: number): number {
 // A hard floor (terrain + tallest tree + margin) at and just ahead of the camera
 // guarantees no clipping even if the smooth path ever came up short.
 
-export const TREE_MAX_HEIGHT = 0.018 // mirrors TREE_H in the shader (tallest possible tree)
+export const TREE_MAX_HEIGHT = 0.018 // tallest possible tree (trunk base to crown top)
 
 export interface FlightParams {
   speed: number // world units per second
@@ -347,5 +349,293 @@ export class Flight {
     this.pitch += (pitchTarget - this.pitch) * ease(dt, PITCH_TAU)
     const rollTarget = clamp(this.turnRate * BANK_PER_TURN, -MAX_BANK, MAX_BANK)
     this.roll += (rollTarget - this.roll) * ease(dt, ROLL_TAU)
+  }
+}
+
+// ---------------------------------------------------------------- forest placement
+//
+// Trees stand on a jittered world grid of TREE_CELL cells, one candidate per cell, so they
+// never swim: everything about a candidate (position, size, species rank, color) comes from
+// a hash of its cell, wrapped with the terrain period. The grid is handed out in square
+// tiles of TREE_TILE world units that are populated once when they come near the camera.
+//
+// Only biome-independent suitability is decided here (slope, the forest/clearing pattern,
+// the widest possible altitude band). Biome-dependent parts (density, water level, snow
+// line, conifer share) are applied per frame on the GPU from the stored values, so a biome
+// change grows and shrinks trees smoothly instead of repopulating anything.
+
+export const TREE_CELL = 1 / 40
+export const TREE_TILE = 1 // world units per tile side
+export const TREE_TILE_CELLS = 40
+const TREE_WRAP = PERIOD * TREE_TILE_CELLS // cells per terrain period
+export const TREE_MIN_HEIGHT = 0.011
+export const TREE_MAX_RADIUS = 0.62 * 1.15 * TREE_MAX_HEIGHT // widest crown (broadleaf, widest aspect)
+export const TREE_SINK = 0.0015 // trunks start this far below the ground (plus slope * trunk radius)
+// The highest any tree can grow: lowest snow line minus margin, highest water + tree line
+const TREE_Y_MIN = -0.24 + 0.025
+const TREE_Y_MAX = -0.08 + 0.95
+const SLOPE_E = 0.004
+
+// Floats stored per candidate: local x, ground y, local z, rotation, height,
+// suitability, growth threshold, conifer rank, color mix, crown aspect, ground slope x / z,
+// distance-thinning rank
+export const TREE_FLOATS = 13
+
+const treeScratch = new Float64Array(3)
+
+// Forest/clearing pattern in 0..1 (integer frequency multipliers keep it periodic)
+function clearing(x: number, z: number) {
+  noised(mod(x * 3, PERIOD), mod(z * 3, PERIOD), PERIOD, treeScratch)
+  const a = treeScratch[0]
+  noised(mod(x, PERIOD), mod(z, PERIOD), PERIOD, treeScratch)
+  const v = 0.65 * a + 0.35 * treeScratch[0]
+  return smoothstep01((v + 0.5) / 0.5)
+}
+
+// Writes the candidate of cell (ci, cj) (unwrapped integer cell coordinates) relative to
+// (ox, oz) into out at offset o. Returns false if no tree can ever grow there.
+export function treeCandidate(ci: number, cj: number, ox: number, oz: number, out: Float32Array | Float64Array, o: number) {
+  const wi = mod(ci, TREE_WRAP)
+  const wj = mod(cj, TREE_WRAP)
+  const h = ihash(wi ^ 0x9e3779b9, wj ^ 0x7f4a7c15)
+  const r0 = (h & 255) / 255
+  if (r0 > 0.97) return false
+  const x = (ci + 0.5 + 0.75 * (((h >>> 8) & 255) / 255 - 0.5)) * TREE_CELL
+  const z = (cj + 0.5 + 0.75 * (((h >>> 16) & 255) / 255 - 0.5)) * TREE_CELL
+  const cl = clearing(x, z)
+  if (cl <= r0) return false
+  const y = terrainHeight(x, z, RAYMARCH_OCTAVES)
+  if (y < TREE_Y_MIN || y > TREE_Y_MAX) return false
+  const gx = (terrainHeight(x + SLOPE_E, z, RAYMARCH_OCTAVES) - y) / SLOPE_E
+  const gz = (terrainHeight(x, z + SLOPE_E, RAYMARCH_OCTAVES) - y) / SLOPE_E
+  const slope = Math.hypot(gx, gz)
+  const s = cl * (1 - smoothstep01((slope - 0.45) / 0.4))
+  if (s <= r0) return false
+  const h2 = ihash(h, 0x51ed270b)
+  const r1 = (h2 & 255) / 255
+  const height = TREE_MIN_HEIGHT + (TREE_MAX_HEIGHT - TREE_MIN_HEIGHT) * (((h2 >>> 8) & 255) / 255)
+  out[o] = x - ox
+  out[o + 1] = y - TREE_SINK - slope * 0.06 * height
+  out[o + 2] = z - oz
+  out[o + 3] = (((h2 >>> 16) & 255) / 255) * Math.PI * 2
+  out[o + 4] = height
+  out[o + 5] = s
+  out[o + 6] = r0
+  out[o + 7] = ((h2 >>> 24) + 0.5) / 256 // conifer rank
+  out[o + 8] = r1
+  out[o + 9] = ((h >>> 24) & 255) / 255 // crown aspect
+  out[o + 10] = gx
+  out[o + 11] = gz
+  out[o + 12] = (ihash(h2, 0x2c1b3c6d) >>> 8) / 16777216 // thinning rank
+  return true
+}
+
+// Fills cells of rows [rowFrom, rowTo) of tile (ti, tj) into out starting at candidate
+// index count, positions relative to the tile corner. Returns the new candidate count.
+export function populateTreeRows(ti: number, tj: number, rowFrom: number, rowTo: number, out: Float32Array, count: number) {
+  const ox = ti * TREE_TILE
+  const oz = tj * TREE_TILE
+  for (let j = rowFrom; j < rowTo; j++) {
+    for (let i = 0; i < TREE_TILE_CELLS; i++) {
+      if (treeCandidate(ti * TREE_TILE_CELLS + i, tj * TREE_TILE_CELLS + j, ox, oz, out, count * TREE_FLOATS)) count++
+    }
+  }
+  return count
+}
+
+// ---------------------------------------------------------------- forest tiles
+//
+// Keeps every tile within reach of the camera populated (nearest and in-view first, a few
+// rows per frame so no frame ever stalls), and on request writes the instances of the tiles
+// in view into the GPU buffers. Positions are unwrapped world coordinates (the caller
+// tracks the camera continuously across the terrain's wrap) relative to a floating origin.
+//
+// Far away only a thinned subset is drawn (and drawn larger, keeping the forest's coverage):
+// candidate with thinning rank r is visible while TREE_THIN_DISTANCE / distance > r.
+
+export const TREE_RADIUS = 11 // trees fade out completely at this distance
+export const TREE_FADE_START = 8
+export const TREE_THIN_DISTANCE = 1.2
+const TILE_KEEP = TREE_RADIUS + 0.75 // populate tiles whose centre is this close
+const TILE_DROP = TREE_RADIUS + 1.75
+const THIN_MARGIN = 0.4 // world units of approach a rebuilt buffer stays valid for
+
+interface Tile {
+  ti: number
+  tj: number
+  key: number
+  data: Float32Array | null
+  count: number
+  minY: number
+  maxY: number
+  dist: number
+}
+
+// Upper bounds of the biome-dependent growth factors over the next rebuild interval, so the
+// CPU can skip candidates that are certainly invisible
+export interface ForestBounds {
+  density: number
+  waterMin: number
+  snowMax: number
+}
+
+export type BoxTest = (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number) => boolean
+
+const tileKey = (ti: number, tj: number) => (ti & 0xffff) * 65536 + (tj & 0xffff)
+const smoothstep = (a: number, b: number, x: number) => smoothstep01((x - a) / (b - a))
+
+export class Forest {
+  tiles = new Map<number, Tile>()
+  originX = 0
+  originZ = 0
+  populatedTiles = 0
+  private current: Tile | null = null
+  private row = 0
+  private scratch = new Float32Array(TREE_TILE_CELLS * TREE_TILE_CELLS * TREE_FLOATS)
+  private order: Tile[] = []
+
+  // Adds/drops tiles around the camera (unwrapped x, z) and populates for up to budgetMs
+  update(camX: number, camZ: number, fwdX: number, fwdZ: number, budgetMs: number) {
+    const r = Math.ceil(TILE_KEEP / TREE_TILE) + 1
+    const cti = Math.floor(camX / TREE_TILE)
+    const ctj = Math.floor(camZ / TREE_TILE)
+    for (let dj = -r; dj <= r; dj++) {
+      for (let di = -r; di <= r; di++) {
+        const ti = cti + di
+        const tj = ctj + dj
+        const d = Math.hypot((ti + 0.5) * TREE_TILE - camX, (tj + 0.5) * TREE_TILE - camZ)
+        if (d > TILE_KEEP) continue
+        const key = tileKey(ti, tj)
+        if (!this.tiles.has(key)) {
+          this.tiles.set(key, { ti, tj, key, data: null, count: 0, minY: 0, maxY: 0, dist: d })
+        }
+      }
+    }
+    for (const t of this.tiles.values()) {
+      t.dist = Math.hypot((t.ti + 0.5) * TREE_TILE - camX, (t.tj + 0.5) * TREE_TILE - camZ)
+      if (t.dist > TILE_DROP) {
+        if (t === this.current) this.current = null
+        if (t.data) this.populatedTiles--
+        this.tiles.delete(t.key)
+      }
+    }
+
+    const start = performance.now()
+    while (performance.now() - start < budgetMs) {
+      if (!this.current) {
+        // Next tile: nearest, with tiles behind the camera counted as further away
+        let best: Tile | null = null
+        let bestScore = Infinity
+        for (const t of this.tiles.values()) {
+          if (t.data) continue
+          const ahead = ((t.ti + 0.5) * TREE_TILE - camX) * fwdX + ((t.tj + 0.5) * TREE_TILE - camZ) * fwdZ
+          const score = t.dist + (ahead < -1 ? TREE_RADIUS : 0)
+          if (score < bestScore) {
+            bestScore = score
+            best = t
+          }
+        }
+        if (!best) return
+        this.current = best
+        this.row = 0
+        best.count = 0
+      }
+      const t = this.current
+      const rows = Math.min(this.row + 2, TREE_TILE_CELLS)
+      t.count = populateTreeRows(t.ti, t.tj, this.row, rows, this.scratch, t.count)
+      this.row = rows
+      if (this.row >= TREE_TILE_CELLS) {
+        t.data = this.scratch.slice(0, t.count * TREE_FLOATS)
+        let minY = Infinity
+        let maxY = -Infinity
+        for (let i = 0; i < t.count; i++) {
+          minY = Math.min(minY, t.data[i * TREE_FLOATS + 1])
+          maxY = Math.max(maxY, t.data[i * TREE_FLOATS + 1])
+        }
+        t.minY = t.count > 0 ? minY : 0
+        t.maxY = t.count > 0 ? maxY : 0
+        this.populatedTiles++
+        this.current = null
+      }
+    }
+  }
+
+  // Moves the floating origin near the camera if it has drifted; returns true if it moved
+  // (every instance position must then be rewritten)
+  recenter(camX: number, camZ: number) {
+    if (Math.abs(camX - this.originX) < 16 && Math.abs(camZ - this.originZ) < 16) return false
+    this.originX = Math.round(camX / 16) * 16
+    this.originZ = Math.round(camZ / 16) * 16
+    return true
+  }
+
+  // Writes the instances of every populated tile that passes inView into the buffers
+  // (matrix: yaw + uniform scale by tree height + translation relative to the origin;
+  // tint: suitability, growth threshold, conifer rank, color mix; misc: crown aspect,
+  // ground slope x/z, thinning rank). Nearest tiles first, so a full buffer drops the
+  // farthest trees. Returns the instance count.
+  // Tile distances are those of the last update().
+  rebuild(inView: BoxTest, bounds: ForestBounds,
+    matrices: Float32Array, tint: Float32Array, misc: Float32Array, capacity: number) {
+    const order = this.order
+    order.length = 0
+    for (const t of this.tiles.values()) {
+      if (!t.data || t.count === 0 || t.dist > TREE_RADIUS + 0.75) continue
+      const x0 = t.ti * TREE_TILE - this.originX
+      const z0 = t.tj * TREE_TILE - this.originZ
+      if (!inView(x0, t.minY, z0, x0 + TREE_TILE, t.maxY + TREE_MAX_HEIGHT * 1.8, z0 + TREE_TILE)) continue
+      order.push(t)
+    }
+    order.sort((a, b) => a.dist - b.dist)
+    let n = 0
+    for (const t of order) {
+      const data = t.data as Float32Array
+      const tx = t.ti * TREE_TILE - this.originX
+      const tz = t.tj * TREE_TILE - this.originZ
+      // Closest any tree of this tile can get to the camera before the next rebuild
+      const near = Math.max(t.dist - 0.75 - THIN_MARGIN, 1e-3)
+      const keep = Math.min(1, TREE_THIN_DISTANCE / near)
+      for (let i = 0; i < t.count; i++) {
+        const o = i * TREE_FLOATS
+        if (data[o + 12] >= keep) continue
+        const y = data[o + 1]
+        const aw = y - bounds.waterMin
+        const dens = bounds.density * data[o + 5] * smoothstep(0.025, 0.07, aw)
+          * (1 - smoothstep(bounds.snowMax - 0.25, bounds.snowMax - 0.03, y))
+        if (dens <= data[o + 6]) continue
+        if (n >= capacity) return n
+        const h = data[o + 4]
+        const c = Math.cos(data[o + 3]) * h
+        const s = Math.sin(data[o + 3]) * h
+        const m = n * 16
+        matrices[m] = c
+        matrices[m + 1] = 0
+        matrices[m + 2] = -s
+        matrices[m + 3] = 0
+        matrices[m + 4] = 0
+        matrices[m + 5] = h
+        matrices[m + 6] = 0
+        matrices[m + 7] = 0
+        matrices[m + 8] = s
+        matrices[m + 9] = 0
+        matrices[m + 10] = c
+        matrices[m + 11] = 0
+        matrices[m + 12] = tx + data[o]
+        matrices[m + 13] = y
+        matrices[m + 14] = tz + data[o + 2]
+        matrices[m + 15] = 1
+        const q = n * 4
+        tint[q] = data[o + 5]
+        tint[q + 1] = data[o + 6]
+        tint[q + 2] = data[o + 7]
+        tint[q + 3] = data[o + 8]
+        misc[q] = data[o + 9]
+        misc[q + 1] = data[o + 10]
+        misc[q + 2] = data[o + 11]
+        misc[q + 3] = data[o + 12]
+        n++
+      }
+    }
+    return n
   }
 }

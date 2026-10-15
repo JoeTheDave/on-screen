@@ -32,16 +32,16 @@ export const MIN_WAVE_EVENT_SECONDS = 8
 export const MAX_WAVE_EVENT_SECONDS = 20
 
 // Sphere physics
-export const SPHERE_COUNT = 20
-const MIN_SPHERE_RADIUS = 0.4 // 0.8 - 1.2 cube widths across
-const MAX_SPHERE_RADIUS = 0.6
+export const SPHERE_COUNT = 40
+const MIN_SPHERE_RADIUS = 1.2 // 2.4 - 3.6 cube widths across: big enough to span several cubes, so waves always move them
+const MAX_SPHERE_RADIUS = 1.8
 const GRAVITY = 22
 export const PHYSICS_STEP = 1 / 120
 const MAX_SPEED = 30 // keeps per-step travel well under a sphere radius
 const RESTITUTION = 0.45
 const BOUNCE_THRESHOLD = 1.2 // normal impact speeds below this don't bounce (no resting jitter)
 const FRICTION = 0.3 // Coulomb coefficient against the cube tops
-const ROLLING_DAMPING = 3 // per second, tangential speed lost in contact; lower and they race off the disc
+const ROLLING_DAMPING = 5 // per second, tangential speed lost in contact; lower and they race off the disc
 const SPHERE_RESTITUTION = 0.7
 const FALL_LIMIT = -20 // below this a sphere has left the disc for good: respawn
 const SPAWN_REACH = 0.8 // respawn within this many disc radii of the center
