@@ -1,10 +1,12 @@
 // Pure simulation for Tornado.tsx: town generation, the tornado's life cycle and wind field,
-// progressive structural damage, rigid-body debris, kicked-up dust, the ground scour map, and
-// the storm-chaser camera. No three.js in here so it can be run headlessly.
+// progressive structural damage, rigid-body debris, shredded shards, kicked-up dust, the ground
+// scour map, and the storm-chaser camera. No three.js in here so it can be run headlessly.
 //
-// Units are meters, seconds, kilograms. y is up. Every body (wall panel, roof strip, tree crown,
-// car, loose shingle...) is one box-ish rigid body in a fixed-size structure-of-arrays pool, so
-// the renderer can map it 1:1 onto an InstancedMesh slot and nothing is allocated per cycle.
+// Units are meters, seconds, kilograms. y is up. Structural pieces (wall panels, trunk segments,
+// branches, cars, tanks...) are box-ish rigid bodies in a fixed-size structure-of-arrays pool,
+// mapped 1:1 onto InstancedMesh slots. Everything small (leaf triangles, shingles, roof decking,
+// splinters, glass) is a "shard" in a second, capped pool with cheap drag-dominated physics.
+// Nothing is allocated per frame.
 
 export type Rand = () => number
 
@@ -24,13 +26,24 @@ export function mulberry32(seed: number): Rand {
 
 export const PHYSICS_STEP = 1 / 60
 export const GRAVITY = 9.81
-export const MAX_STRUCT_BODIES = 2600 // buildings, trees, cars, fences, roads
-export const FRAG_POOL = 1400 // recycled small debris: shingles, boards, glass, leaves
-export const MAX_BODIES = MAX_STRUCT_BODIES + FRAG_POOL
+export const MAX_STRUCT_BODIES = 6000 // walls, trunks, branches, cars, fences, roads...
+export const MAX_BODIES = MAX_STRUCT_BODIES
 export const MAX_DUST = 1600 // CPU-advected dust puffs near the ground
 export const SCOUR_SIZE = 256 // texels per side of the ground-scour map
 export const SCOUR_EXTENT = 1000 // meters covered by the scour map, centered on the town
 export const TOWN_RADIUS = 165
+
+// Shards: leaves are triangles (first pool), everything else thin boxes (second pool)
+export const SHARD_TRI = 0
+export const SHARD_TILE = 1
+export const TRI_POOL = 18000
+export const TILE_POOL = 20000
+export const MAX_SHARDS = TRI_POOL + TILE_POOL
+const TRI_RESERVE = 1200 // kept free for leaves that burst out of a crown's interior
+const TILE_RESERVE = 3500 // kept free for splinters, glass and shredded pieces
+const LEAVES_TREE = 76
+const LEAVES_CONIFER = 60
+export const BREAK_DIM = 2.6 // a flying piece bigger than this (cars and tanks aside) shreds
 
 const START_DIST = 330 // the tornado forms this far from the town center
 const FORM_SECONDS = 10
@@ -38,10 +51,15 @@ const MATURE_MAX_SECONDS = 75
 const ROPE_SECONDS = 13
 const AFTER_SECONDS = 9
 const DAMAGE_RATE = 4 // damage per second at 25% over a piece's threshold is 1 (= gone)
+const PEEL_RATE = 6 // per second per unit of overload, for attached shards
 const GROUND_FRICTION = 0.55
 const RESTITUTION = 0.3
 const MAX_SPEED = 110
 const AIR = 0.66 // 0.5 * air density * drag coefficient
+
+// Camera legibility floor: always looking down onto the town by at least this much
+export const CAM_MIN_PITCH = (13.5 * Math.PI) / 180
+export const CAM_MIN_HEIGHT = 45
 
 // Shapes (one InstancedMesh each; all unit-sized, centered, fitting in a unit cube)
 export const SHAPE_BOX = 0
@@ -51,26 +69,26 @@ export const SHAPE_CROWN = 3 // faceted sphere
 export const SHAPE_CONE = 4
 export const SHAPE_COUNT = 5
 
-// Body states
+// Body / shard states
 export const ST_EMPTY = 0
 export const ST_STATIC = 1 // roads, foundations: never move
 export const ST_ATTACHED = 2 // part of an intact structure, taking damage
 export const ST_FLYING = 3
 export const ST_SLEEPING = 4 // loose but at rest on the ground
 
-// Body kinds (drive thresholds, fragments and the collapse rule)
+// Body kinds (drive thresholds, splinters and the collapse rule)
 const K_STATIC = 0
 const K_WALL = 1
-const K_ROOF = 2
-const K_TRIM = 3 // gables, chimneys, steeples, window frames
-const K_TRUNK = 4
-const K_CROWN = 5
+const K_TRIM = 2 // gables, chimneys, steeples, doors
+const K_TRUNK = 3
+const K_BRANCH = 4
+const K_CROWN = 5 // a tree's dense interior foliage: shrinks as leaves strip, never flies
 const K_FENCE = 6
 const K_CAR = 7
 const K_POLE = 8
-const K_FRAG = 9
-const K_HEAVY = 10 // silos, elevators, tanks
-const K_GLASS = 11
+const K_HEAVY = 9 // silos, bins, tanks
+const K_GLASS = 10
+const BREAKABLE = [false, true, true, true, true, false, true, false, true, false, true]
 
 // Storm phases
 export const PH_FORMING = 0
@@ -93,14 +111,49 @@ const TAU = Math.PI * 2
 // Nudge each sRGB channel of a hex color by up to +-amt (0..1)
 function vary(hex: number, rand: Rand, amt: number): number {
   const f = 1 + (rand() * 2 - 1) * amt
+  return scaleHex(hex, f)
+}
+
+function scaleHex(hex: number, f: number): number {
   const r = Math.min(255, Math.max(0, Math.round(((hex >> 16) & 255) * f)))
   const g = Math.min(255, Math.max(0, Math.round(((hex >> 8) & 255) * f)))
   const b = Math.min(255, Math.max(0, Math.round((hex & 255) * f)))
   return (r << 16) | (g << 8) | b
 }
 
+function mixHex(a: number, b: number, t: number): number {
+  const ch = (s: number) => Math.round(((a >> s) & 255) * (1 - t) + ((b >> s) & 255) * t)
+  return (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+// Rotate (vx, vy, vz) by quaternion q (x, y, z, w) into out
+function qrot(q: readonly number[], vx: number, vy: number, vz: number, out: number[]) {
+  const x = q[0], y = q[1], z = q[2], w = q[3]
+  const tx = 2 * (y * vz - z * vy)
+  const ty = 2 * (z * vx - x * vz)
+  const tz = 2 * (x * vy - y * vx)
+  out[0] = vx + w * tx + (y * tz - z * ty)
+  out[1] = vy + w * ty + (z * tx - x * tz)
+  out[2] = vz + w * tz + (x * ty - y * tx)
+}
+
+function randomQuat(rand: Rand, out: number[]) {
+  const u1 = rand()
+  const u2 = rand() * TAU
+  const u3 = rand() * TAU
+  const a = Math.sqrt(1 - u1)
+  const b = Math.sqrt(u1)
+  out[0] = a * Math.sin(u2)
+  out[1] = a * Math.cos(u2)
+  out[2] = b * Math.sin(u3)
+  out[3] = b * Math.cos(u3)
+}
+
+const _v3 = [0, 0, 0]
+const _q4 = [0, 0, 0, 1]
+
 // ---------------------------------------------------------------------------------------------
-// World: the body pool plus everything regenerated per cycle
+// World: the body pool, the shard pool, plus everything regenerated per cycle
 
 export interface Structure {
   x: number
@@ -112,10 +165,28 @@ export interface Structure {
   walls: number
   wallsLeft: number
   collapsed: boolean
+  roofGroups: number[]
+}
+
+// A run of attached shards that share a fate: one roof layer, or the leaves on one branch
+export interface ShardGroup {
+  first: number // shard index range
+  last: number
+  x: number // cull sphere
+  y: number
+  z: number
+  r: number
+  total: number
+  lost: number
+  cover: number // group lying on top of this one (shingles over decking), or -1
+  nx: number // outward horizontal normal of a roof plane (0 for flat roofs and leaves)
+  nz: number
+  core: number // tree crown body these leaves belong to, or -1
+  released: boolean
 }
 
 export interface World {
-  count: number // structural bodies in use; fragments live at [MAX_STRUCT_BODIES, MAX_BODIES)
+  count: number // structural bodies in use
   px: Float32Array
   py: Float32Array
   pz: Float32Array
@@ -135,28 +206,64 @@ export interface World {
   hx: Float32Array // half extents
   hy: Float32Array
   hz: Float32Array
+  scale: Float32Array // render scale (a crown shrinks as it loses leaves)
   k: Float32Array // drag acceleration per (m/s)^2
   wake: Float32Array // wind speed that lifts a resting body again
   threshold: Float32Array // wind speed where damage starts
-  damage: Float32Array
+  damage: Float32Array // attached: damage 0..1; loose: seconds since it let go
+  breakAt: Float32Array // flight time after which a big loose piece shreds in strong wind
+  leaves: Float32Array // crowns: leaves still on the tree
+  leavesTotal: Float32Array
   shake: Float32Array // 0..1 visual vibration of a loaded, still-attached piece
   rest: Float32Array
   color: Uint32Array // sRGB hex
   parent: Int32Array
   structure: Int32Array
+  bodyGroup: Int32Array // shard group released when this body lets go
   shape: Uint8Array
   kind: Uint8Array
   state: Uint8Array
-  shed: Uint8Array // remaining shingles/siding this piece can shed before failing
+  shed: Uint8Array // remaining siding this piece can shed before failing
   inst: Int32Array // instance slot in its shape's mesh
   dirty: Uint8Array // matrix needs re-upload
   colorDirty: Uint8Array
-  shapeCount: Int32Array // instances per shape (box includes the fragment pool)
+  shapeCount: Int32Array // instances per shape
   structures: Structure[]
   obstacles: { x: number; z: number; r: number; top: number }[] // for camera clearance
-  fragCursor: number
   roadAngle: number
   stepIndex: number
+  // Shards
+  spx: Float32Array
+  spy: Float32Array
+  spz: Float32Array
+  svx: Float32Array
+  svy: Float32Array
+  svz: Float32Array
+  sqx: Float32Array
+  sqy: Float32Array
+  sqz: Float32Array
+  sqw: Float32Array
+  sux: Float32Array // tumble axis
+  suy: Float32Array
+  suz: Float32Array
+  sspin: Float32Array // tumble rate, rad/s
+  ssx: Float32Array // full size
+  ssy: Float32Array
+  ssz: Float32Array
+  sk: Float32Array // drag acceleration per (m/s)^2
+  sthr: Float32Array // attached: wind speed that peels it off
+  scolor: Uint32Array
+  sstate: Uint8Array
+  sgroup: Int32Array
+  sdirty: Uint8Array
+  scolorDirty: Uint8Array
+  shardUsed: Int32Array // attached shards generated per pool
+  shardCursor: Int32Array // runtime spawn cursor per pool (absolute index)
+  dirtyLo: Int32Array // per pool: dirty index range for partial uploads
+  dirtyHi: Int32Array
+  colorLo: Int32Array
+  colorHi: Int32Array
+  groups: ShardGroup[]
   // Dust (rendered as points straight from these arrays)
   dustPos: Float32Array
   dustVel: Float32Array
@@ -168,21 +275,26 @@ export interface World {
   scour: Uint8Array
   // Stats (for tests and tuning)
   detached: number
-  fragmentsSpawned: number
+  shredded: number
+  shardsPeeled: number
+  shardsSpawned: number
 }
 
 export function createWorld(): World {
   const n = MAX_BODIES
   const f = () => new Float32Array(n)
+  const m = MAX_SHARDS
+  const g = () => new Float32Array(m)
   return {
     count: 0,
     px: f(), py: f(), pz: f(), vx: f(), vy: f(), vz: f(),
     qx: f(), qy: f(), qz: f(), qw: f(), wx: f(), wy: f(), wz: f(),
-    sax: f(), say: f(), saz: f(), hx: f(), hy: f(), hz: f(),
-    k: f(), wake: f(), threshold: f(), damage: f(), shake: f(), rest: f(),
+    sax: f(), say: f(), saz: f(), hx: f(), hy: f(), hz: f(), scale: f(),
+    k: f(), wake: f(), threshold: f(), damage: f(), breakAt: f(), leaves: f(), leavesTotal: f(), shake: f(), rest: f(),
     color: new Uint32Array(n),
     parent: new Int32Array(n).fill(-1),
     structure: new Int32Array(n).fill(-1),
+    bodyGroup: new Int32Array(n).fill(-1),
     shape: new Uint8Array(n),
     kind: new Uint8Array(n),
     state: new Uint8Array(n),
@@ -193,9 +305,23 @@ export function createWorld(): World {
     shapeCount: new Int32Array(SHAPE_COUNT),
     structures: [],
     obstacles: [],
-    fragCursor: 0,
     roadAngle: 0,
     stepIndex: 0,
+    spx: g(), spy: g(), spz: g(), svx: g(), svy: g(), svz: g(),
+    sqx: g(), sqy: g(), sqz: g(), sqw: g(), sux: g(), suy: g(), suz: g(), sspin: g(),
+    ssx: g(), ssy: g(), ssz: g(), sk: g(), sthr: g(),
+    scolor: new Uint32Array(m),
+    sstate: new Uint8Array(m),
+    sgroup: new Int32Array(m).fill(-1),
+    sdirty: new Uint8Array(m),
+    scolorDirty: new Uint8Array(m),
+    shardUsed: new Int32Array(2),
+    shardCursor: new Int32Array(2),
+    dirtyLo: new Int32Array(2),
+    dirtyHi: new Int32Array(2),
+    colorLo: new Int32Array(2),
+    colorHi: new Int32Array(2),
+    groups: [],
     dustPos: new Float32Array(MAX_DUST * 3),
     dustVel: new Float32Array(MAX_DUST * 3),
     dustAge: new Float32Array(MAX_DUST),
@@ -205,8 +331,28 @@ export function createWorld(): World {
     dustCursor: 0,
     scour: new Uint8Array(SCOUR_SIZE * SCOUR_SIZE),
     detached: 0,
-    fragmentsSpawned: 0,
+    shredded: 0,
+    shardsPeeled: 0,
+    shardsSpawned: 0,
   }
+}
+
+const poolBase = (pool: number) => (pool === SHARD_TRI ? 0 : TRI_POOL)
+const poolSize = (pool: number) => (pool === SHARD_TRI ? TRI_POOL : TILE_POOL)
+const poolOf = (i: number) => (i < TRI_POOL ? SHARD_TRI : SHARD_TILE)
+
+function markShard(w: World, i: number) {
+  w.sdirty[i] = 1
+  const p = poolOf(i)
+  if (i < w.dirtyLo[p]) w.dirtyLo[p] = i
+  if (i > w.dirtyHi[p]) w.dirtyHi[p] = i
+}
+
+function markShardColor(w: World, i: number) {
+  w.scolorDirty[i] = 1
+  const p = poolOf(i)
+  if (i < w.colorLo[p]) w.colorLo[p] = i
+  if (i > w.colorHi[p]) w.colorHi[p] = i
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -228,10 +374,14 @@ const DOORS = [0x5a2e22, 0x2f3a4a, 0x6b6b5a, 0x7a1f1f, 0x2e4030]
 const TRUNK = 0x4a3a2c
 const CROWNS = [0x2e4a22, 0x3a5527, 0x24401f, 0x4a5a2a, 0x355226]
 const CONIFERS = [0x1f3820, 0x26402a, 0x203a28]
+const AUTUMN = 0x6a7a2e // the odd yellowing leaf
 const CARS = [0xb02a2a, 0x2a4f8a, 0xd8d8d8, 0x262626, 0x6a6e72, 0xc9b27a, 0x2f5a3a, 0x8a1f1f, 0xe8e8e8, 0x1f3550]
 const FENCES = [0xe8e6e0, 0x8a7a66, 0x6e604f]
 const POLE = 0x5e4a38
 const GLASS = 0x8fa3ad
+const DECKING = 0x8a6c4a // plywood/OSB under the shingles
+const MEMBRANE = 0x55524e // flat-roof membrane
+const METAL_DECK = 0x7a7e80
 
 // ---------------------------------------------------------------------------------------------
 // Town generation
@@ -278,6 +428,11 @@ class Builder {
     return this.w.count + n <= MAX_STRUCT_BODIES
   }
 
+  shardRoom(pool: number, n: number) {
+    const cap = pool === SHARD_TRI ? TRI_POOL - TRI_RESERVE : TILE_POOL - TILE_RESERVE
+    return this.w.shardUsed[pool] + n <= cap
+  }
+
   // Add one body in frame f at local center (lx, ly, lz) with local rotation lq (x,y,z,w).
   add(
     f: Frame, shape: number, kind: number,
@@ -304,20 +459,25 @@ class Builder {
     w.hx[i] = sx / 2
     w.hy[i] = sy / 2
     w.hz[i] = sz / 2
+    w.scale[i] = 1
     const area = (sx * sy + sy * sz + sx * sz) / 2 // mean projected area of a box
     w.k[i] = (AIR * area) / Math.max(mass, 0.1)
     w.wake[i] = Math.max(16, Math.sqrt((GROUND_FRICTION * GRAVITY) / w.k[i]) * 1.15)
     w.threshold[i] = threshold * this.quality
     w.damage[i] = 0
+    w.breakAt[i] = 0
+    w.leaves[i] = 0
+    w.leavesTotal[i] = 0
     w.shake[i] = 0
     w.rest[i] = 0
     w.color[i] = vary(color, this.rand, 0.05)
     w.parent[i] = parent
     w.structure[i] = this.structure
+    w.bodyGroup[i] = -1
     w.shape[i] = shape
     w.kind[i] = kind
     w.state[i] = kind === K_STATIC ? ST_STATIC : ST_ATTACHED
-    w.shed[i] = kind === K_ROOF ? 10 : kind === K_WALL ? 3 : 0
+    w.shed[i] = kind === K_WALL ? 3 : 0
     this.randomSpinAxis(i)
     w.inst[i] = w.shapeCount[shape]++
     w.dirty[i] = 1
@@ -335,9 +495,56 @@ class Builder {
     w.saz[i] = r * Math.sin(a)
   }
 
+  // Start a group of shards; they are added contiguously until the next group starts
+  group(x: number, y: number, z: number, r: number, cover: number, nx: number, nz: number, core: number, pool: number) {
+    const w = this.w
+    w.groups.push({
+      first: poolBase(pool) + w.shardUsed[pool], last: poolBase(pool) + w.shardUsed[pool],
+      x, y, z, r, total: 0, lost: 0, cover, nx, nz, core, released: false,
+    })
+    return w.groups.length - 1
+  }
+
+  closeGroup(g: number) {
+    const grp = this.w.groups[g]
+    const pool = poolOf(grp.first)
+    grp.last = poolBase(pool) + this.w.shardUsed[pool]
+    grp.total = grp.last - grp.first
+  }
+
+  // One attached shard at frame-local (lx, ly, lz) with frame-local rotation lq
+  shard(
+    f: Frame, pool: number, lx: number, ly: number, lz: number, lq: readonly number[],
+    sx: number, sy: number, sz: number, color: number, fallSpeed: number, thr: number,
+  ) {
+    const w = this.w
+    if (!this.shardRoom(pool, 1)) return false
+    const i = poolBase(pool) + w.shardUsed[pool]++
+    w.spx[i] = f.ox + f.c * lx + f.s * lz
+    w.spy[i] = ly
+    w.spz[i] = f.oz - f.s * lx + f.c * lz
+    const ay = f.qy, aw = f.qw
+    const bx = lq[0], by = lq[1], bz = lq[2], bw = lq[3]
+    w.sqx[i] = aw * bx + ay * bz
+    w.sqy[i] = aw * by + ay * bw
+    w.sqz[i] = aw * bz - ay * bx
+    w.sqw[i] = aw * bw - ay * by
+    w.svx[i] = w.svy[i] = w.svz[i] = 0
+    w.sspin[i] = 0
+    w.ssx[i] = sx
+    w.ssy[i] = sy
+    w.ssz[i] = sz
+    w.sk[i] = GRAVITY / (fallSpeed * fallSpeed)
+    w.sthr[i] = thr * this.quality
+    w.scolor[i] = color
+    w.sstate[i] = ST_ATTACHED
+    w.sgroup[i] = w.groups.length - 1
+    return true
+  }
+
   begin(x: number, z: number, radius: number, top: number) {
     this.structure = this.w.structures.length
-    this.w.structures.push({ x, z, radius, top, first: this.w.count, last: this.w.count, walls: 0, wallsLeft: 0, collapsed: false })
+    this.w.structures.push({ x, z, radius, top, first: this.w.count, last: this.w.count, walls: 0, wallsLeft: 0, collapsed: false, roofGroups: [] })
     this.w.obstacles.push({ x, z, r: radius, top })
     this.foot.push({ x, z, r: radius })
     this.quality = range(this.rand, 0.85, 1.2)
@@ -381,6 +588,64 @@ class Builder {
         this.add(f, SHAPE_BOX, K_STATIC, t, 0.065, 0, 4, 0.02, 0.18, CENTER_LINE, Infinity, 1)
       }
     }
+  }
+
+  // One layer of tiles over a roof plane. The plane is centered at frame-local (cx, cy, cz),
+  // tilted by lq, spans lu along its local x and lv along its local z; off lifts the layer
+  // along the plane's normal. Edge and corner tiles are weaker, so peeling starts there.
+  tileLayer(
+    f: Frame, cx: number, cy: number, cz: number, lq: readonly number[], lu: number, lv: number,
+    tu: number, tv: number, off: number, thick: number, color: number, colorVar: number, thr: number, fall: number,
+  ) {
+    const rand = this.rand
+    const nu = Math.max(1, Math.ceil(lu / tu - 0.05))
+    const nv = Math.max(1, Math.ceil(lv / tv - 0.05))
+    const du = lu / nu
+    const dv = lv / nv
+    for (let iv = 0; iv < nv; iv++) {
+      for (let iu = 0; iu < nu; iu++) {
+        qrot(lq, -lu / 2 + du * (iu + 0.5), off, -lv / 2 + dv * (iv + 0.5), _v3)
+        const eu = Math.min(iu, nu - 1 - iu)
+        const ev = Math.min(iv, nv - 1 - iv)
+        const edge = eu === 0 && ev === 0 ? 0.62 : eu === 0 || ev === 0 ? 0.74 : eu === 1 || ev === 1 ? 0.88 : 1
+        if (!this.shard(
+          f, SHARD_TILE, cx + _v3[0], cy + _v3[1], cz + _v3[2], lq, du * 1.03, thick, dv * 1.03,
+          vary(color, rand, colorVar), fall * range(rand, 0.9, 1.1), thr * edge * range(rand, 0.9, 1.12),
+        )) return
+      }
+    }
+  }
+
+  // A roof plane: decking boards under shingles (or metal sheets / membrane). The decking only
+  // lets go once most of what covers it has gone.
+  roofPlane(
+    f: Frame, cx: number, cy: number, cz: number, lq: readonly number[], lu: number, lv: number,
+    color: number, thr: number, flat: boolean,
+  ) {
+    const st = this.w.structures[this.structure]
+    qrot(lq, 0, 1, 0, _v3)
+    // outward horizontal normal in world space (zero for a flat roof)
+    let nx = f.c * _v3[0] + f.s * _v3[2]
+    let nz = -f.s * _v3[0] + f.c * _v3[2]
+    const nl = Math.hypot(nx, nz)
+    if (nl < 0.05) {
+      nx = nz = 0
+    } else {
+      nx /= nl
+      nz /= nl
+    }
+    const wx = f.ox + f.c * cx + f.s * cz
+    const wz = f.oz - f.s * cx + f.c * cz
+    const r = Math.hypot(lu, lv) / 2 + 1
+    const deck = this.group(wx, cy, wz, r, this.w.groups.length + 1, nx, nz, -1, SHARD_TILE)
+    if (flat) this.tileLayer(f, cx, cy, cz, lq, lu, lv, 1.8, 1.5, 0.04, 0.08, METAL_DECK, 0.06, thr * 1.2, 13)
+    else this.tileLayer(f, cx, cy, cz, lq, lu, lv, 1.6, 1.2, 0.06, 0.07, DECKING, 0.1, thr * 1.15, 11)
+    this.closeGroup(deck)
+    const top = this.group(wx, cy, wz, r, -1, nx, nz, -1, SHARD_TILE)
+    if (flat) this.tileLayer(f, cx, cy, cz, lq, lu, lv, 1.5, 1.5, 0.11, 0.06, color, 0.08, thr, 9)
+    else this.tileLayer(f, cx, cy, cz, lq, lu, lv, 1.3, 1.0, 0.125, 0.05, color, 0.1, thr, 8.5)
+    this.closeGroup(top)
+    st.roofGroups.push(deck, top)
   }
 
   // Gabled building: ridge along local x, front wall at local +z. Returns false if out of room.
@@ -445,23 +710,15 @@ class Builder {
     for (const side of [1, -1]) {
       this.add(f, SHAPE_WEDGE, K_TRIM, side * (w / 2 - t / 2), wallTop + roofH / 2, 0, d, roofH, t, wallColor, roofT + 5, d * roofH * 0.5 * opts.wallArea, -1, gq)
     }
-    // Roof: two slopes, each split into strips along the ridge
+    // Roof: two slopes, each decking under shingles, all small pieces
     const o = 0.5
     const run = d / 2 + o
     const slope = run / Math.cos(pitch)
-    const nr = Math.max(1, Math.round((w + 2 * o) / 3.6))
-    const sw = (w + 2 * o) / nr
     const top = wallTop + roofH
     for (const side of [1, -1]) {
       const a = side * pitch
       const q = [Math.sin(a / 2), 0, 0, Math.cos(a / 2)]
-      // midpoint of the slope from ridge to eave, lifted half a thickness off it
-      const zm = side * (run * 0.5 + Math.sin(pitch) * 0.12)
-      const ym = top - run * Math.tan(pitch) * 0.5 + Math.cos(pitch) * 0.12
-      for (let i = 0; i < nr; i++) {
-        const x = -w / 2 - o + sw * (i + 0.5)
-        if (this.add(f, SHAPE_BOX, K_ROOF, x, ym, zm, sw, 0.2, slope, roofColor, roofT, sw * slope * 22, -1, q) < 0) return false
-      }
+      this.roofPlane(f, 0, top - run * Math.tan(pitch) * 0.5, side * run * 0.5, q, w + 2 * o, slope, roofColor, roofT, false)
     }
     if (opts.chimney) {
       const cx = (rand() < 0.5 ? -1 : 1) * w * 0.28
@@ -477,7 +734,7 @@ class Builder {
     const w = range(rand, 9, 13.5)
     const d = range(rand, 7, 9.5)
     const r = Math.hypot(w, d) / 2 + 1.5
-    if (!this.free(x, z, r) || !this.room(48)) return false
+    if (!this.free(x, z, r) || !this.room(48) || !this.shardRoom(SHARD_TILE, 220)) return false
     const top = 0.35 + stories * 2.8 + (d / 2) * Math.tan(0.5)
     this.begin(x, z, r, top)
     const f = frameFacing(x, z, fx, fz)
@@ -498,7 +755,7 @@ class Builder {
     const w = range(rand, 3, 5)
     const d = range(rand, 2.5, 4)
     const r = Math.hypot(w, d) / 2 + 0.5
-    if (!this.free(x, z, r) || !this.room(16)) return false
+    if (!this.free(x, z, r) || !this.room(16) || !this.shardRoom(SHARD_TILE, 60)) return false
     this.begin(x, z, r, 3.5)
     this.gabled(frameFacing(x, z, fx, fz), w, d, 1, 2.3, 0.35, rand() < 0.5 ? METAL : pick(rand, HOUSE_WALLS), pick(rand, BARN_ROOFS), 38, 32, {
       windows: false, door: 0, chimney: false, wallArea: 14,
@@ -512,7 +769,7 @@ class Builder {
     const w = range(rand, 16, 24)
     const d = range(rand, 11, 14)
     const r = Math.hypot(w, d) / 2 + 1
-    if (!this.free(x, z, r) || !this.room(60)) return false
+    if (!this.free(x, z, r) || !this.room(60) || !this.shardRoom(SHARD_TILE, 520)) return false
     const wall = pick(rand, BARN_WALLS)
     this.begin(x, z, r, 4.5 + d * 0.5)
     const f = frameFacing(x, z, fx, fz)
@@ -533,7 +790,7 @@ class Builder {
     const w = range(rand, 22, 34)
     const d = range(rand, 14, 20)
     const r = Math.hypot(w, d) / 2 + 2
-    if (!this.free(x, z, r) || !this.room(130)) return false
+    if (!this.free(x, z, r) || !this.room(130) || !this.shardRoom(SHARD_TILE, 520)) return false
     const brick = rand() < 0.65
     const wallColor = brick ? pick(rand, BRICK) : METAL
     const storyH = 4.2
@@ -567,15 +824,9 @@ class Builder {
       below.length = 0
       below.push(...panels)
     }
-    // Flat roof tiles (light membrane/deck: the first thing to go) plus a parapet cap
+    // Flat roof: metal decking under membrane tiles, the first thing to go
     const top = base + stories * storyH
-    const tx = Math.round(w / 6)
-    const tz = Math.round(d / 6)
-    for (let i = 0; i < tx; i++) {
-      for (let j = 0; j < tz; j++) {
-        this.add(f, SHAPE_BOX, K_ROOF, -w / 2 + (w / tx) * (i + 0.5), top + 0.15, -d / 2 + (d / tz) * (j + 0.5), w / tx, 0.3, d / tz, 0x55524e, 40, (w / tx) * (d / tz) * 30)
-      }
-    }
+    this.roofPlane(f, 0, top, 0, [0, 0, 0, 1], w, d, MEMBRANE, 40, true)
     if (rand() < 0.6) {
       // rooftop HVAC unit
       this.add(f, SHAPE_BOX, K_TRIM, w * 0.2, top + 1.0, 0, 3, 1.4, 2, METAL, 42, 900)
@@ -589,7 +840,7 @@ class Builder {
     const w = range(rand, 16, 20)
     const d = range(rand, 9, 11)
     const r = Math.hypot(w + 4, d) / 2 + 1
-    if (!this.free(x, z, r) || !this.room(90)) return false
+    if (!this.free(x, z, r) || !this.room(90) || !this.shardRoom(SHARD_TILE, 340)) return false
     const wall = rand() < 0.5 ? 0xece8de : pick(rand, BRICK)
     this.begin(x, z, r, 22)
     // The ridge runs toward the road, so build in a frame whose local +x points at it
@@ -654,21 +905,99 @@ class Builder {
     return true
   }
 
+  // A tree: a three-segment trunk, a few branches, a dark interior "core" of foliage, and a
+  // crown of many small leaf triangles. Wind strips the leaves (outermost first), then snaps
+  // branches, then the trunk; the core shrinks with the leaves and never flies.
   tree(x: number, z: number) {
     const rand = this.rand
-    if (!this.free(x, z, 2) || !this.room(2)) return false
     const conifer = rand() < 0.3
-    const h = range(rand, 3, 5.5)
-    const cr = range(rand, 4, 7.5)
+    const nLeaves = conifer ? LEAVES_CONIFER : LEAVES_TREE
+    if (!this.free(x, z, 2) || !this.room(9) || !this.shardRoom(SHARD_TRI, nLeaves)) return false
+    const h = range(rand, 3, 5.5) // crown base
+    const cr = range(rand, 4, 7.5) // crown diameter
     const f = frameFacing(x, z, rand() - 0.5, rand() - 0.5)
-    const trunk = this.add(f, SHAPE_CYL, K_TRUNK, 0, h / 2, 0, 0.6, h, 0.6, TRUNK, 52, 500)
-    if (conifer) {
-      this.add(f, SHAPE_CONE, K_CROWN, 0, h * 0.6 + cr, 0, cr * 0.9, cr * 2.2, cr * 0.9, pick(rand, CONIFERS), 34, 280, trunk)
-    } else {
-      this.add(f, SHAPE_CROWN, K_CROWN, 0, h + cr * 0.35, 0, cr, cr * range(rand, 0.8, 1.05), cr, pick(rand, CROWNS), 30, 260, trunk)
+    const leafColor = pick(rand, conifer ? CONIFERS : CROWNS)
+    const trunkTop = conifer ? h * 0.6 + cr * 0.6 : h + cr * 0.3
+    const seg = trunkTop / 3
+    const segs: number[] = []
+    let parent = -1
+    for (let k = 0; k < 3; k++) {
+      const dia = 0.62 - 0.1 * k
+      parent = this.add(f, SHAPE_CYL, K_TRUNK, 0, seg * (k + 0.5), 0, dia, seg, dia, TRUNK, [68, 58, 52][k], 160 * seg * (dia / 0.6) ** 2, parent)
+      segs.push(parent)
+    }
+    const crownY = conifer ? h * 0.6 + cr : h + cr * 0.35
+    const vy = range(rand, 0.8, 1.05)
+    const core = conifer
+      ? this.add(f, SHAPE_CONE, K_CROWN, 0, crownY - cr * 0.1, 0, cr * 0.62, cr * 1.8, cr * 0.62, scaleHex(leafColor, 0.6), Infinity, 200, segs[2])
+      : this.add(f, SHAPE_CROWN, K_CROWN, 0, crownY, 0, cr * 0.66, cr * vy * 0.66, cr * 0.66, scaleHex(leafColor, 0.6), Infinity, 200, segs[2])
+    this.w.leaves[core] = nLeaves
+    this.w.leavesTotal[core] = nLeaves
+    const nb = conifer ? 3 : 4
+    const branchPhi: number[] = []
+    const owners: number[] = []
+    const phi0 = rand() * TAU
+    for (let j = 0; j < nb; j++) {
+      const phi = phi0 + ((j + (rand() - 0.5) * 0.5) * TAU) / nb
+      const by = conifer ? h * 0.6 + cr * 0.6 * (0.15 + (0.75 * j) / nb) : range(rand, Math.max(seg * 2, h * 0.9), trunkTop)
+      const tilt = conifer ? 1.25 : range(rand, 0.75, 1.05)
+      const len = conifer ? Math.min(2.0, cr * 0.32) : Math.min(2.4, cr * 0.42)
+      const dx = Math.sin(tilt) * Math.cos(phi)
+      const dy = Math.cos(tilt)
+      const dz = Math.sin(tilt) * Math.sin(phi)
+      const ql = Math.hypot(dz, dx, 1 + dy)
+      const lq = [dz / ql, 0, -dx / ql, (1 + dy) / ql] // turns the cylinder's +y onto (dx, dy, dz)
+      const par = by >= seg * 2 ? segs[2] : by >= seg ? segs[1] : segs[0]
+      const b = this.add(f, SHAPE_CYL, K_BRANCH, dx * len * 0.5, by + dy * len * 0.5, dz * len * 0.5, 0.17, len, 0.17, TRUNK, range(rand, 40, 46), 25 * len, par, lq)
+      branchPhi.push(phi)
+      owners.push(b)
+    }
+    owners.push(segs[2]) // the leaves around the top of the trunk
+    const wx = f.ox
+    const wz = f.oz
+    const R = cr / 2
+    const perBranch = Math.floor((nLeaves * 0.82) / nb)
+    for (let j = 0; j <= nb; j++) {
+      const count = j < nb ? perBranch : nLeaves - perBranch * nb
+      const g = this.group(wx, crownY, wz, cr * 1.2, -1, 0, 0, core, SHARD_TRI)
+      this.w.bodyGroup[owners[j]] = g
+      for (let n = 0; n < count; n++) {
+        let lx: number, ly: number, lz: number, rho: number
+        if (conifer) {
+          // tiers up the cone, the top tier hanging on the trunk itself
+          const t = (j + rand()) / (nb + 1)
+          const radius = (1 - t) * cr * 0.45
+          rho = range(rand, 0.72, 1.02)
+          const a = rand() * TAU
+          lx = Math.cos(a) * radius * rho
+          lz = Math.sin(a) * radius * rho
+          ly = crownY - cr * 1.1 + t * cr * 2.2
+        } else {
+          let phi: number, el: number
+          if (j < nb) {
+            phi = branchPhi[j] + ((rand() - 0.5) * 1.15 * TAU) / nb
+            el = range(rand, -0.55, 0.9)
+            rho = 0.6 + 0.4 * Math.sqrt(rand())
+          } else {
+            phi = rand() * TAU
+            el = range(rand, 0.55, 1.5)
+            rho = range(rand, 0.45, 1.0)
+          }
+          lx = Math.cos(el) * Math.cos(phi) * R * rho
+          ly = crownY + Math.sin(el) * R * vy * rho
+          lz = Math.cos(el) * Math.sin(phi) * R * rho
+        }
+        randomQuat(rand, _q4)
+        const size = range(rand, 0.45, 0.8)
+        const col = rand() < 0.12 ? vary(mixHex(leafColor, AUTUMN, 0.6), rand, 0.15) : vary(leafColor, rand, 0.22)
+        // outer leaves give way first
+        const thr = range(rand, 22, 30) * (1.3 - 0.45 * Math.min(1, rho)) * (j === nb ? 1.1 : 1)
+        this.shard(f, SHARD_TRI, lx, ly, lz, _q4, size, 1, size, col, range(rand, 4.5, 6), thr)
+      }
+      this.closeGroup(g)
     }
     this.foot.push({ x, z, r: 2 })
-    this.w.obstacles.push({ x, z, r: 2, top: h + cr })
+    this.w.obstacles.push({ x, z, r: 2, top: conifer ? crownY + cr * 1.1 : crownY + R })
     return true
   }
 
@@ -716,23 +1045,29 @@ class Builder {
 }
 
 export function generateTown(w: World, rand: Rand) {
-  // Reset the pool (fragments included)
+  // Reset both pools
   w.count = 0
   w.state.fill(ST_EMPTY)
   w.parent.fill(-1)
   w.structure.fill(-1)
+  w.bodyGroup.fill(-1)
   w.dirty.fill(1)
   w.shapeCount.fill(0)
   w.structures = []
   w.obstacles = []
-  w.fragCursor = 0
+  w.groups = []
   w.stepIndex = 0
+  w.sstate.fill(ST_EMPTY)
+  w.sgroup.fill(-1)
+  w.shardUsed.fill(0)
   w.dustSize.fill(0)
   w.dustAlpha.fill(0)
   w.dustLife.fill(0)
   w.scour.fill(0)
   w.detached = 0
-  w.fragmentsSpawned = 0
+  w.shredded = 0
+  w.shardsPeeled = 0
+  w.shardsSpawned = 0
 
   const b = new Builder(w, rand)
   const angle = rand() * Math.PI
@@ -807,9 +1142,10 @@ export function generateTown(w: World, rand: Rand) {
     }
   }
   lots.sort((a, c) => a.pri - c.pri)
-  const houseBudget = MAX_STRUCT_BODIES - 650 // keep room for farms, trees, fences and poles
+  // keep room for farms, trees, fences and poles (bodies) and the farms' roofs (tiles)
+  const houseBudget = MAX_STRUCT_BODIES - 3200
   for (const lot of lots) {
-    if (w.count > houseBudget) break
+    if (w.count > houseBudget || !b.shardRoom(SHARD_TILE, 3400)) break
     if (rand() < 0.82) b.house(lot.x, lot.z, lot.fx, lot.fz)
     else if (rand() < 0.5) b.tree(lot.x, lot.z)
   }
@@ -863,29 +1199,25 @@ export function generateTown(w: World, rand: Rand) {
   }
 
   // Scattered trees: tree lines along field edges and lone trees
-  for (let i = 0; i < 400 && b.room(4); i++) {
+  for (let i = 0; i < 400 && b.room(9) && b.shardRoom(SHARD_TRI, LEAVES_TREE); i++) {
     const a = rand() * TAU
     const rr = range(rand, 40, 560)
     b.tree(Math.cos(a) * rr, Math.sin(a) * rr)
   }
 
-  // Fragment pool: box instances after the structural boxes
-  const fragBase = w.shapeCount[SHAPE_BOX]
-  for (let j = 0; j < FRAG_POOL; j++) {
-    const i = MAX_STRUCT_BODIES + j
-    w.state[i] = ST_EMPTY
-    w.shape[i] = SHAPE_BOX
-    w.kind[i] = K_FRAG
-    w.inst[i] = fragBase + j
-    w.dirty[i] = 1
-    w.colorDirty[i] = 1
-    w.color[i] = 0x777777
-  }
-  w.shapeCount[SHAPE_BOX] += FRAG_POOL
+  // Runtime spawns go into whatever is left of each shard pool
+  w.shardCursor[SHARD_TRI] = w.shardUsed[SHARD_TRI]
+  w.shardCursor[SHARD_TILE] = TRI_POOL + w.shardUsed[SHARD_TILE]
+  w.sdirty.fill(1)
+  w.scolorDirty.fill(1)
+  w.dirtyLo[0] = w.colorLo[0] = 0
+  w.dirtyHi[0] = w.colorHi[0] = TRI_POOL - 1
+  w.dirtyLo[1] = w.colorLo[1] = TRI_POOL
+  w.dirtyHi[1] = w.colorHi[1] = MAX_SHARDS - 1
 }
 
 // ---------------------------------------------------------------------------------------------
-// The storm
+// The storm: always a single funnel
 
 export interface Storm {
   time: number
@@ -926,9 +1258,6 @@ export interface Storm {
   wobble: number
   ph1: number
   ph2: number
-  subCount: number
-  svPhase: number
-  svOmega: number
   nearestX: number
   nearestZ: number
   nearestD: number
@@ -987,14 +1316,10 @@ export function newStorm(rand: Rand): Storm {
     wobble: 0,
     ph1: rand() * TAU,
     ph2: rand() * TAU,
-    subCount: style === 0 ? 0 : Math.floor(range(rand, style === 2 ? 3 : 0, style === 2 ? 6 : 4)),
-    svPhase: rand() * TAU,
-    svOmega: 0,
     nearestX: x,
     nearestZ: z,
     nearestD: Infinity,
   }
-  s.svOmega = (0.45 * Vmax) / (0.8 * RcBase)
   stepStorm(s, 0)
   return s
 }
@@ -1058,7 +1383,6 @@ export function stepStorm(s: Storm, dt: number) {
   s.wobble = s.wobbleBase * (1 + 2.5 * s.rope)
   s.leanX = s.leanBaseX * (1 + 0.8 * s.rope)
   s.leanZ = s.leanBaseZ * (1 + 0.8 * s.rope)
-  s.svPhase = (((s.svPhase - s.svOmega * dt) % TAU) + TAU) % TAU
   const d = Math.hypot(s.x, s.z)
   if (s.phase <= PH_ROPEOUT && d < s.nearestD) {
     s.nearestD = d
@@ -1109,10 +1433,9 @@ export function windAt(s: Storm, x: number, y: number, z: number, out: Float32Ar
 const influenceRadius = (s: Storm) => s.Rc * 6.5 + 30
 
 // ---------------------------------------------------------------------------------------------
-// Damage and debris
+// Shards: small pieces with drag-dominated physics and no collisions beyond the ground
 
 const _w = new Float32Array(3)
-const _sv = new Float64Array(16)
 
 function spawnDust(w: World, x: number, y: number, z: number, vx: number, vy: number, vz: number, size: number, life: number) {
   const j = w.dustCursor
@@ -1129,132 +1452,362 @@ function spawnDust(w: World, x: number, y: number, z: number, vx: number, vy: nu
   w.dustAlpha[j] = 0
 }
 
-// Fragment types: [sx, sy, sz, mass]
-// (masses give terminal velocities of roughly 10-25 m/s, so the core's updraft can loft them)
-const FRAG_SHINGLE = [0.9, 0.05, 0.4, 1.5]
-const FRAG_PLANK = [2.4, 0.1, 0.22, 5]
-const FRAG_SHEET = [1.3, 0.05, 1.0, 7]
-const FRAG_CHUNK = [0.6, 0.4, 0.45, 18]
-const FRAG_LEAVES = [0.9, 0.6, 0.8, 0.8]
-const FRAG_GLASS = [0.5, 0.03, 0.4, 1.5]
+// Splinter types: [sx, sy, sz, fall speed m/s]
+const SH_PLANK = [1.1, 0.06, 0.16, 12]
+const SH_SHEET = [0.8, 0.04, 0.6, 9]
+const SH_CHUNK = [0.45, 0.3, 0.35, 16]
+const SH_GLASS = [0.35, 0.02, 0.28, 10]
 
-function spawnFragment(w: World, rand: Rand, x: number, y: number, z: number, vx: number, vy: number, vz: number, color: number, type: readonly number[]) {
+function randomAxis(w: World, rand: Rand, i: number) {
+  const u = rand() * 2 - 1
+  const a = rand() * TAU
+  const r = Math.sqrt(1 - u * u)
+  w.sux[i] = r * Math.cos(a)
+  w.suy[i] = u
+  w.suz[i] = r * Math.sin(a)
+}
+
+// Send an attached shard flying with a share of the local wind
+function launchShard(w: World, rand: Rand, i: number, wx: number, wy: number, wz: number, kick: number) {
+  w.sstate[i] = ST_FLYING
+  w.svx[i] = wx * kick + (rand() - 0.5) * 3
+  w.svy[i] = wy * kick + 1 + rand() * 3
+  w.svz[i] = wz * kick + (rand() - 0.5) * 3
+  w.sspin[i] = 4 + rand() * 10
+  randomAxis(w, rand, i)
+  markShard(w, i)
+}
+
+// A new loose shard from a pool's runtime region (never touches attached shards)
+function spawnShard(
+  w: World, rand: Rand, pool: number, x: number, y: number, z: number, vx: number, vy: number, vz: number,
+  color: number, sx: number, sy: number, sz: number, fall: number,
+) {
+  const lo = poolBase(pool) + w.shardUsed[pool]
+  const hi = poolBase(pool) + poolSize(pool)
+  const n = hi - lo
+  if (n <= 0) return
   // Prefer a slot that is free or at rest; fall back to the oldest flier
-  let slot = -1
-  for (let n = 0; n < 48; n++) {
-    const j = (w.fragCursor + n) % FRAG_POOL
-    if (w.state[MAX_STRUCT_BODIES + j] !== ST_FLYING) {
-      slot = j
+  let i = -1
+  let c = w.shardCursor[pool]
+  if (c < lo || c >= hi) c = lo
+  for (let probe = 0; probe < 48; probe++) {
+    const j = lo + ((c - lo + probe) % n)
+    if (w.sstate[j] !== ST_FLYING) {
+      i = j
       break
     }
   }
-  if (slot < 0) slot = w.fragCursor
-  w.fragCursor = (slot + 1) % FRAG_POOL
-  const i = MAX_STRUCT_BODIES + slot
+  if (i < 0) i = c
+  w.shardCursor[pool] = i + 1 >= hi ? lo : i + 1
   const sc = range(rand, 0.75, 1.25)
-  const sx = type[0] * sc
-  const sy = type[1] * sc
-  const sz = type[2] * sc
-  w.px[i] = x
-  w.py[i] = Math.max(y, 0.3)
-  w.pz[i] = z
-  w.vx[i] = vx
-  w.vy[i] = vy
-  w.vz[i] = vz
-  // random orientation
-  const u1 = rand()
-  const u2 = rand() * TAU
-  const u3 = rand() * TAU
-  const a = Math.sqrt(1 - u1)
-  const b = Math.sqrt(u1)
-  w.qx[i] = a * Math.sin(u2)
-  w.qy[i] = a * Math.cos(u2)
-  w.qz[i] = b * Math.sin(u3)
-  w.qw[i] = b * Math.cos(u3)
-  w.wx[i] = (rand() - 0.5) * 12
-  w.wy[i] = (rand() - 0.5) * 12
-  w.wz[i] = (rand() - 0.5) * 12
-  w.hx[i] = sx / 2
-  w.hy[i] = sy / 2
-  w.hz[i] = sz / 2
-  const area = (sx * sy + sy * sz + sx * sz) / 2
-  w.k[i] = (AIR * area) / (type[3] * sc * sc)
-  w.wake[i] = Math.max(16, Math.sqrt((GROUND_FRICTION * GRAVITY) / w.k[i]) * 1.15)
-  const u = rand() * 2 - 1
-  const ang = rand() * TAU
-  const rr = Math.sqrt(1 - u * u)
-  w.sax[i] = rr * Math.cos(ang)
-  w.say[i] = u
-  w.saz[i] = rr * Math.sin(ang)
-  w.rest[i] = 0
-  w.state[i] = ST_FLYING
-  w.color[i] = vary(color, rand, 0.12)
-  w.dirty[i] = 1
-  w.colorDirty[i] = 1
-  w.fragmentsSpawned++
+  w.spx[i] = x
+  w.spy[i] = Math.max(y, 0.3)
+  w.spz[i] = z
+  randomQuat(rand, _q4)
+  w.sqx[i] = _q4[0]
+  w.sqy[i] = _q4[1]
+  w.sqz[i] = _q4[2]
+  w.sqw[i] = _q4[3]
+  w.ssx[i] = sx * sc
+  w.ssy[i] = pool === SHARD_TRI ? 1 : sy * sc
+  w.ssz[i] = sz * sc
+  w.sk[i] = GRAVITY / (fall * fall)
+  w.sthr[i] = 0
+  w.sgroup[i] = -1
+  w.scolor[i] = vary(color, rand, 0.12)
+  markShardColor(w, i)
+  launchShard(w, rand, i, vx, vy, vz, 1)
+  w.shardsSpawned++
 }
 
-function fragmentTypeFor(kind: number, rand: Rand): readonly number[] {
+function spawnSplinter(w: World, rand: Rand, x: number, y: number, z: number, vx: number, vy: number, vz: number, color: number, type: readonly number[]) {
+  spawnShard(w, rand, SHARD_TILE, x, y, z, vx, vy, vz, color, type[0], type[1], type[2], type[3])
+}
+
+function splinterFor(kind: number, rand: Rand): readonly number[] {
   switch (kind) {
-    case K_ROOF: return rand() < 0.6 ? FRAG_SHINGLE : FRAG_SHEET
-    case K_WALL: return rand() < 0.5 ? FRAG_PLANK : rand() < 0.5 ? FRAG_SHEET : FRAG_CHUNK
-    case K_CROWN: return rand() < 0.8 ? FRAG_LEAVES : FRAG_PLANK
-    case K_GLASS: return FRAG_GLASS
-    case K_HEAVY: return rand() < 0.5 ? FRAG_SHEET : FRAG_CHUNK
-    case K_CAR: return rand() < 0.5 ? FRAG_GLASS : FRAG_CHUNK
-    default: return rand() < 0.5 ? FRAG_PLANK : FRAG_CHUNK
+    case K_WALL: return rand() < 0.45 ? SH_PLANK : rand() < 0.5 ? SH_SHEET : SH_CHUNK
+    case K_GLASS: return SH_GLASS
+    case K_HEAVY: return rand() < 0.5 ? SH_SHEET : SH_CHUNK
+    case K_CAR: return rand() < 0.5 ? SH_GLASS : SH_CHUNK
+    case K_TRUNK: case K_BRANCH: case K_POLE: case K_FENCE: return SH_PLANK
+    default: return rand() < 0.5 ? SH_PLANK : SH_CHUNK
   }
+}
+
+// A crown losing leaves shrinks; nearly bare, the interior bursts into loose leaves and is gone
+function leavesLost(w: World, s: Storm, rand: Rand, core: number, n: number) {
+  if (core < 0 || w.state[core] !== ST_ATTACHED) return
+  w.leaves[core] = Math.max(0, w.leaves[core] - n)
+  const frac = w.leaves[core] / Math.max(1, w.leavesTotal[core])
+  if (frac < 0.22) {
+    vanishCore(w, s, rand, core)
+  } else {
+    w.scale[core] = 0.3 + 0.7 * frac
+    w.dirty[core] = 1
+  }
+}
+
+function vanishCore(w: World, s: Storm, rand: Rand, i: number) {
+  w.state[i] = ST_EMPTY
+  w.dirty[i] = 1
+  windAt(s, w.px[i], w.py[i], w.pz[i], _w)
+  const wx = _w[0], wy = _w[1], wz = _w[2]
+  const r = Math.max(w.hx[i], w.hz[i]) * w.scale[i]
+  const n = Math.round(6 + 10 * w.scale[i])
+  for (let k = 0; k < n; k++) {
+    const size = range(rand, 0.45, 0.75)
+    spawnShard(
+      w, rand, SHARD_TRI,
+      w.px[i] + (rand() - 0.5) * r * 2, w.py[i] + (rand() - 0.5) * w.hy[i] * w.scale[i] * 2, w.pz[i] + (rand() - 0.5) * r * 2,
+      wx * 0.35, wy * 0.35, wz * 0.35, scaleHex(w.color[i], 1.6), size, 1, size, range(rand, 4.5, 6),
+    )
+  }
+}
+
+// Everything still attached in a group lets go at once (its branch snapped, its walls fell)
+function releaseGroup(w: World, s: Storm, rand: Rand, g: number) {
+  const grp = w.groups[g]
+  if (grp.released) return
+  grp.released = true
+  windAt(s, grp.x, grp.y, grp.z, _w)
+  const wx = _w[0], wy = _w[1], wz = _w[2]
+  let n = 0
+  for (let i = grp.first; i < grp.last; i++) {
+    if (w.sstate[i] !== ST_ATTACHED) continue
+    launchShard(w, rand, i, wx, wy, wz, 0.3)
+    n++
+  }
+  grp.lost += n
+  w.shardsPeeled += n
+  leavesLost(w, s, rand, grp.core, n)
+}
+
+function integrateShard(w: World, s: Storm, i: number, dt: number) {
+  windAt(s, w.spx[i], w.spy[i], w.spz[i], _w)
+  let vx = w.svx[i], vy = w.svy[i], vz = w.svz[i]
+  const rx = vx - _w[0], ry = vy - _w[1], rz = vz - _w[2]
+  const rel = Math.sqrt(rx * rx + ry * ry + rz * rz)
+  // Quadratic drag, semi-implicit; gravity balances it at the shard's fall speed
+  const f = 1 / (1 + w.sk[i] * rel * dt)
+  vx = _w[0] + rx * f
+  vy = _w[1] + ry * f - GRAVITY * dt
+  vz = _w[2] + rz * f
+  const sp = Math.sqrt(vx * vx + vy * vy + vz * vz)
+  if (sp > MAX_SPEED) {
+    const c = MAX_SPEED / sp
+    vx *= c; vy *= c; vz *= c
+  }
+  let px = w.spx[i] + vx * dt
+  let py = w.spy[i] + vy * dt
+  let pz = w.spz[i] + vz * dt
+  // Tumble about the shard's own axis, faster in stronger relative wind
+  const size = Math.max(w.ssx[i], w.ssz[i])
+  const target = (Math.min(rel, 60) * 0.5) / (size + 0.2)
+  const spin = w.sspin[i] + (target - w.sspin[i]) * Math.min(1, dt * 3)
+  w.sspin[i] = spin
+  const half = 0.5 * spin * dt
+  const sn = Math.sin(half)
+  const ax = w.sux[i] * sn, ay = w.suy[i] * sn, az = w.suz[i] * sn, aw = Math.cos(half)
+  const x = w.sqx[i], y = w.sqy[i], z = w.sqz[i], q = w.sqw[i]
+  w.sqx[i] = aw * x + ax * q + ay * z - az * y
+  w.sqy[i] = aw * y - ax * z + ay * q + az * x
+  w.sqz[i] = aw * z + ax * y - ay * x + az * q
+  w.sqw[i] = aw * q - ax * x - ay * y - az * z
+  const ground = i < TRI_POOL ? 0.02 : w.ssy[i] * 0.5
+  if (py <= ground) {
+    py = ground
+    if (vy < -8 && i >= TRI_POOL) {
+      // a stiff piece skips once
+      vy = -vy * 0.25
+      vx *= 0.5
+      vz *= 0.5
+    } else {
+      // lie flat where it landed
+      const yaw = 2 * Math.atan2(w.sqy[i], w.sqw[i])
+      w.sqx[i] = 0
+      w.sqy[i] = Math.sin(yaw / 2)
+      w.sqz[i] = 0
+      w.sqw[i] = Math.cos(yaw / 2)
+      vx = vy = vz = 0
+      w.sspin[i] = 0
+      w.sstate[i] = ST_SLEEPING
+    }
+  }
+  if (py > s.H * 1.05) {
+    py = s.H * 1.05
+    if (vy > 0) vy = 0
+  }
+  px = Math.max(-3000, Math.min(3000, px))
+  pz = Math.max(-3000, Math.min(3000, pz))
+  if (!Number.isFinite(px + py + pz + vx + vy + vz + w.sqx[i] + w.sqy[i] + w.sqz[i] + w.sqw[i])) {
+    // a numerical blow-up parks the shard rather than poisoning the frame
+    px = s.x
+    py = ground
+    pz = s.z
+    vx = vy = vz = 0
+    w.sqx[i] = w.sqy[i] = w.sqz[i] = 0
+    w.sqw[i] = 1
+    w.sspin[i] = 0
+    w.sstate[i] = ST_SLEEPING
+  }
+  w.spx[i] = px
+  w.spy[i] = py
+  w.spz[i] = pz
+  w.svx[i] = vx
+  w.svy[i] = vy
+  w.svz[i] = vz
+  markShard(w, i)
+}
+
+function stepShards(w: World, s: Storm, dt: number, rand: Rand) {
+  const reach = influenceRadius(s)
+  const active = s.intensity > 0.001
+  const step = w.stepIndex
+  // Attached: each in-reach group's shards take turns (every other step) testing the wind
+  if (active) {
+    for (let g = 0; g < w.groups.length; g++) {
+      const grp = w.groups[g]
+      if (grp.released || grp.lost >= grp.total) continue
+      const dx = grp.x - s.x
+      const dz = grp.z - s.z
+      const rr = reach + grp.r
+      if (dx * dx + dz * dz > rr * rr) continue
+      // losing neighbours weakens the rest; covered decking holds until its covering is gone
+      let mult = 1 - (0.35 * grp.lost) / Math.max(1, grp.total)
+      if (grp.cover >= 0) {
+        const cv = w.groups[grp.cover]
+        mult *= 1 + 0.6 * (1 - cv.lost / Math.max(1, cv.total))
+      }
+      const dt2 = dt * 2
+      for (let i = grp.first + ((step + g) & 1); i < grp.last; i += 2) {
+        if (w.sstate[i] !== ST_ATTACHED) continue
+        windAt(s, w.spx[i], w.spy[i], w.spz[i], _w)
+        const sp = Math.sqrt(_w[0] * _w[0] + _w[1] * _w[1] + _w[2] * _w[2])
+        let load = sp / (w.sthr[i] * mult)
+        if (grp.nx !== 0 || grp.nz !== 0) {
+          // the slope facing into the wind takes it hardest
+          const hs = Math.hypot(_w[0], _w[2]) + 1e-3
+          const facing = -(_w[0] * grp.nx + _w[2] * grp.nz) / hs
+          if (facing > 0) load *= 1 + 0.25 * facing
+        }
+        if (load > 1 && rand() < (load - 1) * PEEL_RATE * dt2) {
+          launchShard(w, rand, i, _w[0], _w[1], _w[2], 0.3)
+          grp.lost++
+          w.shardsPeeled++
+          if (grp.core >= 0) leavesLost(w, s, rand, grp.core, 1)
+        }
+      }
+    }
+  }
+  // Loose: fliers integrate every step; resting ones near the storm check the wind now and then
+  const cx = s.x
+  const cz = s.z
+  const reach2 = reach * reach
+  for (let i = 0; i < MAX_SHARDS; i++) {
+    const st = w.sstate[i]
+    if (st === ST_FLYING) {
+      integrateShard(w, s, i, dt)
+    } else if (st === ST_SLEEPING && active && ((step + i) & 7) === 0) {
+      const dx = w.spx[i] - cx
+      const dz = w.spz[i] - cz
+      if (dx * dx + dz * dz > reach2) continue
+      windAt(s, w.spx[i], 1, w.spz[i], _w)
+      const wake = Math.max(9, 1.5 * Math.sqrt(GRAVITY / w.sk[i]))
+      if (Math.hypot(_w[0], _w[2]) > wake) {
+        w.sstate[i] = ST_FLYING
+        w.svy[i] = 2 + rand() * 3
+        w.sspin[i] = 4 + rand() * 6
+        randomAxis(w, rand, i)
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Structural damage and rigid debris
+
+const bodyDim = (w: World, i: number) => 2 * Math.max(w.hx[i], w.hy[i], w.hz[i])
+
+// A big loose piece comes apart into splinters
+function shred(w: World, rand: Rand, i: number) {
+  const sx = w.hx[i] * 2, sy = w.hy[i] * 2, sz = w.hz[i] * 2
+  const n = Math.max(3, Math.min(16, Math.round((sx * sy + sy * sz + sx * sz) / 1.2)))
+  const q = [w.qx[i], w.qy[i], w.qz[i], w.qw[i]]
+  const kind = w.kind[i]
+  const color = kind === K_GLASS ? GLASS : w.color[i]
+  for (let k = 0; k < n; k++) {
+    qrot(q, (rand() - 0.5) * sx, (rand() - 0.5) * sy, (rand() - 0.5) * sz, _v3)
+    spawnSplinter(
+      w, rand, w.px[i] + _v3[0], w.py[i] + _v3[1], w.pz[i] + _v3[2],
+      w.vx[i] + (rand() - 0.5) * 5, w.vy[i] + rand() * 3, w.vz[i] + (rand() - 0.5) * 5, color, splinterFor(kind, rand),
+    )
+  }
+  w.state[i] = ST_EMPTY
+  w.dirty[i] = 1
+  w.shredded++
 }
 
 function detach(w: World, s: Storm, rand: Rand, i: number, depth = 0) {
   if (w.state[i] !== ST_ATTACHED) return
+  const kind = w.kind[i]
+  if (kind === K_CROWN) {
+    vanishCore(w, s, rand, i)
+    return
+  }
   w.state[i] = ST_FLYING
   w.detached++
   windAt(s, w.px[i], w.py[i], w.pz[i], _w)
+  const wx = _w[0], wy = _w[1], wz = _w[2]
   const kick = 0.25 + 0.15 * rand()
-  w.vx[i] = _w[0] * kick + (rand() - 0.5) * 2
-  w.vy[i] = _w[1] * kick + 1.5 + rand() * 3
-  w.vz[i] = _w[2] * kick + (rand() - 0.5) * 2
+  w.vx[i] = wx * kick + (rand() - 0.5) * 2
+  w.vy[i] = wy * kick + 1.5 + rand() * 3
+  w.vz[i] = wz * kick + (rand() - 0.5) * 2
   w.wx[i] = (rand() - 0.5) * 3
   w.wy[i] = (rand() - 0.5) * 3
   w.wz[i] = (rand() - 0.5) * 3
   w.rest[i] = 0
   w.shake[i] = 0
+  w.damage[i] = 0 // from here on: seconds loose
+  w.breakAt[i] = range(rand, 0.25, 1.0)
   w.dirty[i] = 1
-  const kind = w.kind[i]
-  // Splinters and shards burst off as it goes
+  // Splinters burst off as it goes
   const face = Math.max(w.hx[i] * w.hy[i], w.hy[i] * w.hz[i], w.hx[i] * w.hz[i]) * 4
-  const nFrag = kind === K_FENCE || kind === K_POLE || kind === K_TRUNK ? 1 : Math.min(6, 1 + Math.floor(face / 3))
+  const nFrag = kind === K_GLASS ? 0 : kind === K_FENCE || kind === K_POLE || kind === K_TRUNK || kind === K_BRANCH ? 1 : Math.min(4, 1 + Math.floor(face / 4))
   for (let n = 0; n < nFrag; n++) {
-    spawnFragment(
+    spawnSplinter(
       w, rand,
       w.px[i] + (rand() - 0.5) * w.hx[i] * 2, w.py[i] + (rand() - 0.5) * w.hy[i] * 2, w.pz[i] + (rand() - 0.5) * w.hz[i] * 2,
-      _w[0] * 0.35 + (rand() - 0.5) * 6, _w[1] * 0.35 + rand() * 4, _w[2] * 0.35 + (rand() - 0.5) * 6,
-      kind === K_GLASS ? GLASS : w.color[i], fragmentTypeFor(kind, rand),
+      wx * 0.35 + (rand() - 0.5) * 6, wy * 0.35 + rand() * 4, wz * 0.35 + (rand() - 0.5) * 6,
+      w.color[i], splinterFor(kind, rand),
     )
   }
   for (let n = 0; n < 2; n++) {
-    spawnDust(w, w.px[i], Math.max(1, w.py[i] - w.hy[i]), w.pz[i], _w[0] * 0.3, 2, _w[2] * 0.3, range(rand, 5, 10), range(rand, 2, 4))
+    spawnDust(w, w.px[i], Math.max(1, w.py[i] - w.hy[i]), w.pz[i], wx * 0.3, 2, wz * 0.3, range(rand, 5, 10), range(rand, 2, 4))
   }
+  // The leaves on a snapped branch go with it, a few at a time as it tumbles
+  if (w.bodyGroup[i] >= 0) releaseGroup(w, s, rand, w.bodyGroup[i])
   // Anything this piece was holding goes with it
   if (depth < 6) {
     const lo = Math.max(0, i - 64)
     const hi = Math.min(w.count, i + 64)
     for (let j = lo; j < hi; j++) if (w.parent[j] === i) detach(w, s, rand, j, depth + 1)
   }
-  // Losing half its walls drops whatever roof is left
+  // Losing half its walls drops whatever roof is left, shingle by shingle
   const si = w.structure[i]
   if (si >= 0 && kind === K_WALL) {
     const st = w.structures[si]
     st.wallsLeft--
     if (!st.collapsed && st.wallsLeft < st.walls * 0.55) {
       st.collapsed = true
-      for (let j = st.first; j < st.last; j++) {
-        const kj = w.kind[j]
-        if (kj === K_ROOF || kj === K_TRIM) detach(w, s, rand, j, depth + 1)
-      }
+      for (const g of st.roofGroups) releaseGroup(w, s, rand, g)
+      for (let j = st.first; j < st.last; j++) if (w.kind[j] === K_TRIM) detach(w, s, rand, j, depth + 1)
     }
   }
+  // Glass shatters outright; gables, steeples, chimneys, poles and tower legs don't fly in one piece
+  const dim = bodyDim(w, i)
+  if (kind === K_GLASS || (kind === K_TRIM && dim > BREAK_DIM) || (BREAKABLE[kind] && dim > 2 * BREAK_DIM)) shred(w, rand, i)
 }
 
 // Bodies resting on the ground tip over onto their broadest face
@@ -1342,10 +1895,12 @@ function integrate(w: World, s: Storm, rand: Rand, i: number, dt: number) {
   const x = w.qx[i], y = w.qy[i], z = w.qz[i], q = w.qw[i]
   const ext = Math.abs(2 * (x * y + z * q)) * w.hx[i] + Math.abs(1 - 2 * (x * x + z * z)) * w.hy[i] + Math.abs(2 * (y * z - x * q)) * w.hz[i]
   let grounded = false
+  let impact = 0
   if (py - ext <= 0) {
     grounded = true
     py = ext
     if (vy < 0) {
+      impact = -vy
       if (vy < -7 && k < 0.02) {
         // heavy impact: a puff of dirt
         spawnDust(w, px, 0.5, pz, vx * 0.2, 1.5, vz * 0.2, range(rand, 4, 8), range(rand, 1.5, 3))
@@ -1382,6 +1937,17 @@ function integrate(w: World, s: Storm, rand: Rand, i: number, dt: number) {
   w.wy[i] = wy
   w.wz[i] = wz
   w.dirty[i] = 1
+  // Big breakable pieces come apart within a second of letting go (or as they hit the ground);
+  // trunks, branches and other small pieces splinter on a hard landing
+  const kind = w.kind[i]
+  if (BREAKABLE[kind]) {
+    const loose = (w.damage[i] += dt)
+    const big = bodyDim(w, i) > BREAK_DIM
+    if (big ? loose > w.breakAt[i] || impact > 4 : impact > 10 && rand() < 0.5) {
+      shred(w, rand, i)
+      return
+    }
+  }
   if (grounded && vx * vx + vy * vy + vz * vz < 0.3 && wx * wx + wy * wy + wz * wz < 0.4) {
     w.rest[i] += dt
     if (w.rest[i] > 0.7) {
@@ -1413,8 +1979,7 @@ export function stepWorld(w: World, s: Storm, dt: number, rand: Rand) {
   // Ground center is a fine cull point; the lean only matters for lofted debris
   const cx = s.x
   const cz = s.z
-  for (let i = 0; i < MAX_BODIES; i++) {
-    if (i === w.count) i = MAX_STRUCT_BODIES
+  for (let i = 0; i < w.count; i++) {
     const st = w.state[i]
     if (st === ST_EMPTY || st === ST_STATIC) continue
     if (st === ST_FLYING) {
@@ -1459,13 +2024,13 @@ export function stepWorld(w: World, s: Storm, dt: number, rand: Rand) {
     if (shake > 0 || w.shake[i] > 0) w.dirty[i] = 1
     w.shake[i] = shake
     if (load > 0.8 && w.shed[i] > 0 && rand() < (load - 0.8) * 5 * dt) {
-      // Shingles and siding peel off before the piece itself lets go
+      // Siding and boards peel off before the panel itself lets go
       w.shed[i]--
-      spawnFragment(
+      spawnSplinter(
         w, rand,
         w.px[i] + (rand() - 0.5) * w.hx[i] * 1.6, w.py[i] + w.hy[i], w.pz[i] + (rand() - 0.5) * w.hz[i] * 1.6,
         _w[0] * 0.4, _w[1] * 0.4 + 3, _w[2] * 0.4,
-        w.color[i], w.kind[i] === K_ROOF ? FRAG_SHINGLE : FRAG_PLANK,
+        w.color[i], rand() < 0.5 ? SH_PLANK : SH_SHEET,
       )
     }
     if (load > 1) {
@@ -1473,11 +2038,12 @@ export function stepWorld(w: World, s: Storm, dt: number, rand: Rand) {
       if (w.damage[i] >= 1) detach(w, s, rand, i)
     }
   }
+  stepShards(w, s, dt, rand)
 }
 
 // Dust: point masses that follow the wind closely and fade
 export function stepDust(w: World, s: Storm, dt: number, rand: Rand) {
-  // Ground dust and grass torn up in the inflow ring, plus the suction vortices
+  // Ground dust and grass torn up in the inflow ring
   if (s.debris > 0.05 && s.intensity > 0.1) {
     const n = Math.floor(70 * s.debris * dt + rand())
     for (let i = 0; i < n * 2; i++) {
@@ -1510,8 +2076,7 @@ export function stepDust(w: World, s: Storm, dt: number, rand: Rand) {
   }
 }
 
-// Paint where the ground has been scoured: the core's swath plus the suction vortices'
-// cycloidal marks
+// Paint where the ground has been scoured: the core's swath
 export function paintScour(w: World, s: Storm, dt: number) {
   if (s.intensity < 0.15) return
   const reach = s.Rc * 2.4
@@ -1522,23 +2087,12 @@ export function paintScour(w: World, s: Storm, dt: number) {
   const z0 = Math.max(1, Math.floor(toTex(s.z - reach)))
   const z1 = Math.min(SCOUR_SIZE - 2, Math.ceil(toTex(s.z + reach)))
   if (x0 > x1 || z0 > z1) return
-  const sv = _sv
-  const nsv = Math.min(s.subCount, 8)
-  for (let k = 0; k < nsv; k++) {
-    const a = s.svPhase + (k * TAU) / s.subCount
-    sv[k * 2] = s.x + Math.cos(a) * s.Rc * 0.8
-    sv[k * 2 + 1] = s.z + Math.sin(a) * s.Rc * 0.8
-  }
   for (let tz = z0; tz <= z1; tz++) {
     const z = (tz + 0.5) * texel - SCOUR_EXTENT / 2
     for (let tx = x0; tx <= x1; tx++) {
       const x = (tx + 0.5) * texel - SCOUR_EXTENT / 2
       windAt(s, x, 0.5, z, _w)
-      let amt = (Math.hypot(_w[0], _w[2]) - 38) / 45
-      for (let k = 0; k < nsv * 2; k += 2) {
-        const d = Math.hypot(x - sv[k], z - sv[k + 1])
-        if (d < 8) amt += (1 - d / 8) * 1.2 * s.intensity
-      }
+      const amt = (Math.hypot(_w[0], _w[2]) - 38) / 45
       if (amt <= 0) continue
       const idx = tz * SCOUR_SIZE + tx
       w.scour[idx] = Math.min(255, w.scour[idx] + Math.ceil(amt * dt * 255 * 1.5))
@@ -1546,7 +2100,34 @@ export function paintScour(w: World, s: Storm, dt: number) {
   }
 }
 
-// Column-major 4x4 instance matrix for body i (attached pieces under load shiver a little)
+// Column-major 4x4 TRS matrix from a quaternion, full sizes and a position
+function composeMatrix(
+  out: Float32Array, o: number, x: number, y: number, z: number, q: number,
+  sx: number, sy: number, sz: number, px: number, py: number, pz: number,
+) {
+  const x2 = x + x, y2 = y + y, z2 = z + z
+  const xx = x * x2, xy = x * y2, xz = x * z2
+  const yy = y * y2, yz = y * z2, zz = z * z2
+  const wx = q * x2, wy = q * y2, wz = q * z2
+  out[o] = (1 - (yy + zz)) * sx
+  out[o + 1] = (xy + wz) * sx
+  out[o + 2] = (xz - wy) * sx
+  out[o + 3] = 0
+  out[o + 4] = (xy - wz) * sy
+  out[o + 5] = (1 - (xx + zz)) * sy
+  out[o + 6] = (yz + wx) * sy
+  out[o + 7] = 0
+  out[o + 8] = (xz + wy) * sz
+  out[o + 9] = (yz - wx) * sz
+  out[o + 10] = (1 - (xx + yy)) * sz
+  out[o + 11] = 0
+  out[o + 12] = px
+  out[o + 13] = py
+  out[o + 14] = pz
+  out[o + 15] = 1
+}
+
+// Instance matrix for body i (attached pieces under load shiver a little)
 export function writeInstanceMatrix(w: World, i: number, out: Float32Array, o: number, time: number) {
   if (w.state[i] === ST_EMPTY) {
     out.fill(0, o, o + 16)
@@ -1566,32 +2147,23 @@ export function writeInstanceMatrix(w: World, i: number, out: Float32Array, o: n
     const nw = q * c - x * bx - y * by - z * bz
     x = nx; y = ny; z = nz; q = nw
   }
-  const sx = w.hx[i] * 2, sy = w.hy[i] * 2, sz = w.hz[i] * 2
-  const x2 = x + x, y2 = y + y, z2 = z + z
-  const xx = x * x2, xy = x * y2, xz = x * z2
-  const yy = y * y2, yz = y * z2, zz = z * z2
-  const wx = q * x2, wy = q * y2, wz = q * z2
-  out[o] = (1 - (yy + zz)) * sx
-  out[o + 1] = (xy + wz) * sx
-  out[o + 2] = (xz - wy) * sx
-  out[o + 3] = 0
-  out[o + 4] = (xy - wz) * sy
-  out[o + 5] = (1 - (xx + zz)) * sy
-  out[o + 6] = (yz + wx) * sy
-  out[o + 7] = 0
-  out[o + 8] = (xz + wy) * sz
-  out[o + 9] = (yz - wx) * sz
-  out[o + 10] = (1 - (xx + yy)) * sz
-  out[o + 11] = 0
-  out[o + 12] = w.px[i]
-  out[o + 13] = w.py[i]
-  out[o + 14] = w.pz[i]
-  out[o + 15] = 1
+  const k = 2 * w.scale[i]
+  composeMatrix(out, o, x, y, z, q, w.hx[i] * k, w.hy[i] * k, w.hz[i] * k, w.px[i], w.py[i], w.pz[i])
+}
+
+// Instance matrix for shard i (index within the whole shard pool)
+export function writeShardMatrix(w: World, i: number, out: Float32Array, o: number) {
+  if (w.sstate[i] === ST_EMPTY) {
+    out.fill(0, o, o + 16)
+    return
+  }
+  composeMatrix(out, o, w.sqx[i], w.sqy[i], w.sqz[i], w.sqw[i], w.ssx[i], w.ssy[i], w.ssz[i], w.spx[i], w.spy[i], w.spz[i])
 }
 
 // ---------------------------------------------------------------------------------------------
-// Storm-chaser camera: holds a safe distance off the tornado's flank, drifting around it, and
-// swings back over the damage path once it has roped out
+// Storm-chaser camera: holds a safe distance off the tornado's flank from a raised vantage,
+// drifting around it, always looking down onto the town; swings over the damage path once the
+// funnel has roped out
 
 export interface ChaseCam {
   px: number
@@ -1607,11 +2179,12 @@ export interface ChaseCam {
   azPhase: number
   dist: number
   height: number
+  pitch: number // preferred look-down angle
   drone: boolean
 }
 
 export function createChaseCam(s: Storm, w: World, rand: Rand): ChaseCam {
-  const drone = rand() < 0.25
+  const drone = rand() < 0.3
   const cam: ChaseCam = {
     px: 0, py: 0, pz: 0, tx: 0, ty: 0, tz: 0,
     side: rand() < 0.5 ? -1 : 1,
@@ -1620,8 +2193,9 @@ export function createChaseCam(s: Storm, w: World, rand: Rand): ChaseCam {
     azAmp: range(rand, 0.15, 0.35),
     azFreq: range(rand, 0.025, 0.05),
     azPhase: rand() * TAU,
-    dist: Math.max(125 + 3.4 * s.RcBase, 1.12 * s.H) * (drone ? 1.15 : 1),
-    height: drone ? range(rand, 45, 75) : range(rand, 3, 9),
+    dist: Math.max(170 + 3.4 * s.RcBase, 1.3 * s.H) * (drone ? 1.12 : 1),
+    height: drone ? range(rand, 125, 160) : range(rand, 85, 115),
+    pitch: range(rand, 14.5, 17.5) * (Math.PI / 180),
     drone,
   }
   updateChaseCam(cam, s, w, 0, true)
@@ -1646,18 +2220,17 @@ export function updateChaseCam(cam: ChaseCam, s: Storm, w: World, dt: number, sn
   const dist = cam.dist
   const dx = s.x + Math.cos(ang) * dist
   const dz = s.z + Math.sin(ang) * dist
-  const dy = Math.max(cam.height + after * 30, cameraClearance(w, dx, dz))
-  // Aim at the lower third of the funnel, nudged back toward the damage path
+  const dy = Math.max(cam.height + after * 25, cameraClearance(w, dx, dz))
+  // Aim at the ground just behind the funnel (the damage path), looking down at cam.pitch
   const back = 0.12 * dist
   let tx = s.x - Math.cos(s.heading) * back
   let tz = s.z - Math.sin(s.heading) * back
-  let ty = (cam.drone ? 0.27 : 0.36) * s.H
   if (after > 0) {
     // the funnel is gone: look over the wreckage instead
     tx += (s.nearestX - tx) * after
     tz += (s.nearestZ - tz) * after
-    ty += (4 - ty) * after
   }
+  const ty = dy - Math.hypot(tx - dx, tz - dz) * Math.tan(cam.pitch)
   const kp = snap ? 1 : 1 - Math.exp(-dt / 2.2)
   const kt = snap ? 1 : 1 - Math.exp(-dt / 1.2)
   cam.px += (dx - cam.px) * kp
@@ -1666,4 +2239,20 @@ export function updateChaseCam(cam: ChaseCam, s: Storm, w: World, dt: number, sn
   cam.tx += (tx - cam.tx) * kt
   cam.ty += (ty - cam.ty) * kt
   cam.tz += (tz - cam.tz) * kt
+  // Legibility floor: never skimming the ground, never looking flatter than CAM_MIN_PITCH
+  // (with a little margin for the hand-held drift added in chaseCamPose)
+  const horiz = Math.hypot(cam.tx - cam.px, cam.tz - cam.pz)
+  cam.py = Math.max(cam.py, CAM_MIN_HEIGHT, cam.ty + horiz * Math.tan(CAM_MIN_PITCH + 0.012))
+}
+
+// Final camera pose with a little hand-held drift
+export function chaseCamPose(cam: ChaseCam, s: Storm, out: { px: number; py: number; pz: number; tx: number; ty: number; tz: number }) {
+  const t = s.time
+  const shake = cam.drone ? 0.15 : 0.35 + 0.4 * s.intensity
+  out.px = cam.px + Math.sin(t * 0.83) * shake * 0.6
+  out.py = cam.py + Math.sin(t * 1.27 + 1) * shake * 0.3
+  out.pz = cam.pz + Math.sin(t * 0.61 + 2) * shake * 0.6
+  out.tx = cam.tx + Math.sin(t * 0.37) * shake * 2
+  out.ty = cam.ty + Math.sin(t * 0.53 + 0.5) * shake
+  out.tz = cam.tz + Math.sin(t * 0.29 + 1.5) * shake * 2
 }

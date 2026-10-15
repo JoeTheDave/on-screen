@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
 import {
   MAX_BODIES,
-  MAX_STRUCT_BODIES,
+  MAX_SHARDS,
   PHYSICS_STEP,
   PH_AFTER,
   PH_DONE,
@@ -10,8 +10,11 @@ import {
   SCOUR_SIZE,
   SHAPE_BOX,
   SHAPE_COUNT,
+  TILE_POOL,
   TOWN_RADIUS,
+  TRI_POOL,
   centerAt,
+  chaseCamPose,
   createChaseCam,
   createWorld,
   generateTown,
@@ -22,6 +25,7 @@ import {
   stepWorld,
   updateChaseCam,
   writeInstanceMatrix,
+  writeShardMatrix,
   type ChaseCam,
   type Storm,
 } from './tornadoMath'
@@ -32,8 +36,9 @@ const MIN_PIXEL_RATIO = 0.45 // floor for the automatic quality ratchet on slow 
 const SLOW_FRAME_SECONDS = 1 / 45 // average frame time that triggers a resolution drop
 const MAX_FRAME_SECONDS = 1 / 20 // a backgrounded tab resumes with one short step, not a leap
 const MAX_SUBSTEPS = 3
-const FADE_SECONDS = 2.5 // fade to black between towns
+const FADE_SECONDS = 2.5 // fade to black between towns (applied to the final image)
 const BASE_EXPOSURE = 1.25
+const MSAA_SAMPLES = 4
 const FOV = 55
 const FOG_DENSITY = 0.0016 // FogExp2: ~20% at 300 m, gone by ~1.2 km
 const HEMI_INTENSITY = 2.6
@@ -41,7 +46,6 @@ const SUN_INTENSITY = 2.4
 const SUN_ELEVATION_DEG = 11 // low light raking in under the storm's edge
 const FUNNEL_PARTICLES = 2600
 const DEBRIS_PARTICLES = 1200
-const WHIRL_PARTICLES = 600
 const CLOUD_RADIUS = 3600
 const CLOUD_RINGS = 72
 const CLOUD_SEGMENTS = 128
@@ -303,8 +307,8 @@ void main() {
 }
 `
 
-// Every funnel particle's position is a pure function of time, so the whole funnel, debris
-// cloud and suction-vortex dust whirls cost the CPU nothing per frame
+// Every funnel particle's position is a pure function of time, so the whole funnel and its
+// debris cloud cost the CPU nothing per frame. Always one funnel: no satellite vortices.
 const FUNNEL_VERT = /* glsl */ `
 uniform float uTime;
 uniform float uH;
@@ -318,8 +322,6 @@ uniform float uRc;
 uniform float uBottom;
 uniform float uVis;
 uniform float uDebris;
-uniform float uSubCount;
-uniform float uSubPhase;
 uniform float uPointScale;
 uniform float uMaxPoint;
 uniform vec3 uAmbient;
@@ -361,7 +363,7 @@ void main() {
     alpha = 0.3 * smoothstep(uBottom, uBottom + 30.0, y) * smoothstep(0.0, 0.05, h01) * (1.0 - smoothstep(0.92, 1.0, h01)) * uVis;
     float dirt = (1.0 - smoothstep(0.0, 55.0, y)) * uDebris;
     tint = mix(uFunnelTint, uDebrisTint, dirt * 0.75);
-  } else if (aType < 1.5) {
+  } else {
     // debris cloud: dirt and splinters thrown up and out around the base
     float ph = fract(aSeed.x + uTime * (0.07 + 0.06 * aSeed.y));
     float r = uRc * (0.8 + 1.7 * aSeed.w) * (0.85 + 0.5 * ph);
@@ -374,21 +376,6 @@ void main() {
     size = 7.0 + 13.0 * ph + 0.2 * r;
     alpha = 0.26 * uDebris * sin(ph * 3.1416);
     tint = uDebrisTint;
-  } else {
-    // dust whirls: suction vortices orbiting inside the core
-    float n = max(uSubCount, 1.0);
-    float k = floor(aSeed.w * n);
-    float sa = uSubPhase + k * 6.2832 / n;
-    vec2 sc = uBase + vec2(cos(sa), sin(sa)) * uRc * 0.8;
-    float ph = fract(aSeed.x + uTime * (0.25 + 0.2 * aSeed.y));
-    float y = ph * (25.0 + 35.0 * aSeed.y);
-    float r = 1.5 + 5.0 * ph * (0.5 + aSeed.z);
-    float a = aSeed.z * 6.2832 - uTime * 4.0;
-    radial = vec2(cos(a), sin(a));
-    wp = vec3(sc.x + radial.x * r, y, sc.y + radial.y * r);
-    size = 4.0 + 8.0 * ph;
-    alpha = 0.3 * uDebris * step(0.5, uSubCount) * sin(ph * 3.1416);
-    tint = mix(uDebrisTint, uFunnelTint, 0.3);
   }
   // side facing the low light is brighter
   float lit = 0.5 + 0.5 * dot(radial, normalize(uSunDir.xz + vec2(1e-4)));
@@ -448,8 +435,39 @@ void main() {
 }
 `
 
+// Final pass: the whole scene is rendered linear/HDR into a render target, then tone mapped,
+// encoded and faded here, so the fade scales every output pixel by the same factor (built-in
+// materials add fog after tone mapping, so fading by exposure left fogged roads glowing)
+const POST_VERT = /* glsl */ `
+varying vec2 vUv;
+void main() {
+  vUv = position.xy * 0.5 + 0.5;
+  gl_Position = vec4(position.xy, 0.0, 1.0);
+}
+`
+
+const POST_FRAG = /* glsl */ `
+uniform sampler2D uScene;
+uniform float uFade;
+varying vec2 vUv;
+void main() {
+  gl_FragColor = vec4(texture2D(uScene, vUv).rgb, 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+  gl_FragColor.rgb *= uFade;
+}
+`
+
 // ---------------------------------------------------------------------------------------------
 // Geometry helpers
+
+// One leaf: a small triangle lying in the x-z plane
+function makeLeafGeometry() {
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([-0.5, 0, -0.29, 0.5, 0, -0.29, 0, 0, 0.58], 3))
+  geometry.computeVertexNormals()
+  return geometry
+}
 
 // Unit triangular prism: triangle in x-y (apex up), extruded along z
 function makeWedgeGeometry() {
@@ -526,10 +544,26 @@ export default function Tornado() {
     if (!containerRef.current) return
     const container = containerRef.current
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true })
+    // Antialiasing happens in the multisampled scene target; the canvas only gets the final pass
+    const renderer = new THREE.WebGLRenderer({ antialias: false })
     renderer.toneMapping = THREE.ACESFilmicToneMapping
-    renderer.toneMappingExposure = 0
+    renderer.toneMappingExposure = BASE_EXPOSURE
     container.appendChild(renderer.domElement)
+    const sceneTarget = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: MSAA_SAMPLES })
+    const postGeometry = new THREE.BufferGeometry()
+    postGeometry.setAttribute('position', new THREE.Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3))
+    const postMaterial = new THREE.ShaderMaterial({
+      vertexShader: POST_VERT,
+      fragmentShader: POST_FRAG,
+      uniforms: { uScene: { value: sceneTarget.texture }, uFade: { value: 0 } },
+      depthTest: false,
+      depthWrite: false,
+    })
+    const postQuad = new THREE.Mesh(postGeometry, postMaterial)
+    postQuad.frustumCulled = false
+    const postScene = new THREE.Scene()
+    postScene.add(postQuad)
+    const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
 
     const scene = new THREE.Scene()
     scene.fog = new THREE.FogExp2(0x6c7a68, FOG_DENSITY)
@@ -642,15 +676,31 @@ export default function Tornado() {
       meshes.push(mesh)
     }
 
-    // Funnel / debris cloud / dust-whirl particles (positions computed in the vertex shader)
+    // Shards: leaf triangles and small tiles (shingles, decking, splinters, glass), one slot each
+    const leafGeometry = makeLeafGeometry()
+    const tileGeometry = new THREE.BoxGeometry(1, 1, 1)
+    const leafMaterial = new THREE.MeshStandardMaterial({ roughness: 0.75, metalness: 0, flatShading: true, side: THREE.DoubleSide })
+    const shardMeshes = [
+      new THREE.InstancedMesh(leafGeometry, leafMaterial, TRI_POOL),
+      new THREE.InstancedMesh(tileGeometry, bodyMaterial, TILE_POOL),
+    ]
+    for (const mesh of shardMeshes) {
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
+      mesh.setColorAt(0, black)
+      mesh.instanceColor!.setUsage(THREE.DynamicDrawUsage)
+      mesh.frustumCulled = false
+      scene.add(mesh)
+    }
+
+    // Funnel / debris cloud particles (positions computed in the vertex shader)
     const puffTexture = makePuffTexture()
-    const funnelCount = FUNNEL_PARTICLES + DEBRIS_PARTICLES + WHIRL_PARTICLES
+    const funnelCount = FUNNEL_PARTICLES + DEBRIS_PARTICLES
     const funnelGeometry = new THREE.BufferGeometry()
     const seeds = new Float32Array(funnelCount * 4)
     const types = new Float32Array(funnelCount)
     for (let i = 0; i < funnelCount; i++) {
       for (let k = 0; k < 4; k++) seeds[i * 4 + k] = Math.random()
-      types[i] = i < FUNNEL_PARTICLES ? 0 : i < FUNNEL_PARTICLES + DEBRIS_PARTICLES ? 1 : 2
+      types[i] = i < FUNNEL_PARTICLES ? 0 : 1
     }
     funnelGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(funnelCount * 3), 3))
     funnelGeometry.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 4))
@@ -672,8 +722,6 @@ export default function Tornado() {
         uBottom: { value: 0 },
         uVis: { value: 1 },
         uDebris: { value: 0 },
-        uSubCount: { value: 0 },
-        uSubPhase: { value: 0 },
       },
       transparent: true,
       depthWrite: false,
@@ -736,7 +784,9 @@ export default function Tornado() {
       renderer.setSize(w, h)
       camera.aspect = w / h
       camera.updateProjectionMatrix()
-      const bufferHeight = renderer.getDrawingBufferSize(new THREE.Vector2()).y
+      const buffer = renderer.getDrawingBufferSize(new THREE.Vector2())
+      sceneTarget.setSize(buffer.x, buffer.y)
+      const bufferHeight = buffer.y
       shared.uPointScale.value = bufferHeight / (2 * Math.tan(THREE.MathUtils.degToRad(FOV) / 2))
       const gl = renderer.getContext()
       const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | null
@@ -870,6 +920,7 @@ export default function Tornado() {
     let slowTimer = 0
     let animationId = 0
     const center = { x: 0, z: 0 }
+    const pose = { px: 0, py: 0, pz: 0, tx: 0, ty: 0, tz: 0 }
     const ambientScale = 1 / Math.PI
 
     const animate = () => {
@@ -928,8 +979,7 @@ export default function Tornado() {
       const t = storm.time
       const touched = [false, false, false, false, false]
       const touchedColor = [false, false, false, false, false]
-      for (let i = 0; i < MAX_BODIES; i++) {
-        if (i === world.count) i = MAX_STRUCT_BODIES
+      for (let i = 0; i < world.count; i++) {
         if (world.dirty[i]) {
           world.dirty[i] = 0
           const s = world.shape[i]
@@ -947,6 +997,45 @@ export default function Tornado() {
       for (let s = 0; s < SHAPE_COUNT; s++) {
         if (touched[s]) meshes[s].instanceMatrix.needsUpdate = true
         if (touchedColor[s]) meshes[s].instanceColor!.needsUpdate = true
+      }
+      // Shards: only the dirty span of each pool is rewritten and uploaded
+      for (let p = 0; p < 2; p++) {
+        const mesh = shardMeshes[p]
+        const base = p === 0 ? 0 : TRI_POOL
+        const lo = world.dirtyLo[p]
+        const hi = world.dirtyHi[p]
+        if (hi >= lo) {
+          const arr = mesh.instanceMatrix.array as Float32Array
+          for (let i = lo; i <= hi; i++) {
+            if (!world.sdirty[i]) continue
+            world.sdirty[i] = 0
+            writeShardMatrix(world, i, arr, (i - base) * 16)
+          }
+          mesh.instanceMatrix.clearUpdateRanges()
+          mesh.instanceMatrix.addUpdateRange((lo - base) * 16, (hi - lo + 1) * 16)
+          mesh.instanceMatrix.needsUpdate = true
+          world.dirtyLo[p] = MAX_SHARDS
+          world.dirtyHi[p] = -1
+        }
+        const clo = world.colorLo[p]
+        const chi = world.colorHi[p]
+        if (chi >= clo) {
+          const arr = mesh.instanceColor!.array as Float32Array
+          for (let i = clo; i <= chi; i++) {
+            if (!world.scolorDirty[i]) continue
+            world.scolorDirty[i] = 0
+            color.setHex(world.scolor[i])
+            const o = (i - base) * 3
+            arr[o] = color.r
+            arr[o + 1] = color.g
+            arr[o + 2] = color.b
+          }
+          mesh.instanceColor!.clearUpdateRanges()
+          mesh.instanceColor!.addUpdateRange((clo - base) * 3, (chi - clo + 1) * 3)
+          mesh.instanceColor!.needsUpdate = true
+          world.colorLo[p] = MAX_SHARDS
+          world.colorHi[p] = -1
+        }
       }
 
       // Lightning: a few rapid pulses, then a quiet gap
@@ -984,8 +1073,6 @@ export default function Tornado() {
       fu.uBottom.value = storm.funnelBottom
       fu.uVis.value = storm.funnelVis
       fu.uDebris.value = storm.debris
-      fu.uSubCount.value = storm.subCount
-      fu.uSubPhase.value = storm.svPhase
       funnel.visible = storm.phase < PH_AFTER
 
       centerAt(storm, storm.H, center)
@@ -999,21 +1086,17 @@ export default function Tornado() {
 
       // Storm-chaser camera with a little hand-held drift
       updateChaseCam(cam, storm, world, dt)
-      const shake = cam.drone ? 0.15 : 0.35 + 0.4 * storm.intensity
-      camera.position.set(
-        cam.px + Math.sin(t * 0.83) * shake * 0.6,
-        cam.py + Math.sin(t * 1.27 + 1) * shake * 0.3,
-        cam.pz + Math.sin(t * 0.61 + 2) * shake * 0.6,
-      )
-      camera.lookAt(
-        cam.tx + Math.sin(t * 0.37) * shake * 2,
-        cam.ty + Math.sin(t * 0.53 + 0.5) * shake,
-        cam.tz + Math.sin(t * 0.29 + 1.5) * shake * 2,
-      )
+      chaseCamPose(cam, storm, pose)
+      camera.position.set(pose.px, pose.py, pose.pz)
+      camera.lookAt(pose.tx, pose.ty, pose.tz)
       sky.position.copy(camera.position)
 
-      renderer.toneMappingExposure = BASE_EXPOSURE * fade * fade
+      // Scene into the HDR target, then tone map + fade the whole image in one final pass
+      postMaterial.uniforms.uFade.value = fade * fade * (3 - 2 * fade)
+      renderer.setRenderTarget(sceneTarget)
       renderer.render(scene, camera)
+      renderer.setRenderTarget(null)
+      renderer.render(postScene, postCamera)
     }
 
     animate()
@@ -1024,6 +1107,10 @@ export default function Tornado() {
       cancelAnimationFrame(animationId)
       for (const mesh of meshes) mesh.dispose()
       for (const geometry of shapeGeometries) geometry.dispose()
+      for (const mesh of shardMeshes) mesh.dispose()
+      leafGeometry.dispose()
+      tileGeometry.dispose()
+      leafMaterial.dispose()
       bodyMaterial.dispose()
       skyGeometry.dispose()
       skyMaterial.dispose()
@@ -1039,6 +1126,9 @@ export default function Tornado() {
       puffTexture.dispose()
       boltGeometry.dispose()
       boltMaterial.dispose()
+      postGeometry.dispose()
+      postMaterial.dispose()
+      sceneTarget.dispose()
       renderer.dispose()
       container.removeChild(renderer.domElement)
     }
