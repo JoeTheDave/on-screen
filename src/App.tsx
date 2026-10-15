@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import MenuModal from './components/MenuModal'
+import VisualizationErrorBoundary from './components/VisualizationErrorBoundary'
 import FourierEpicycles from './visualizations/FourierEpicycles'
 import ParticleFlowField from './visualizations/ParticleFlowField'
 import FlockingBoids from './visualizations/FlockingBoids'
@@ -68,7 +69,9 @@ function App() {
 
   return (
     <div className="relative w-screen h-screen overflow-hidden">
-      <CurrentVisualization />
+      <VisualizationErrorBoundary key={currentViz}>
+        <CurrentVisualization />
+      </VisualizationErrorBoundary>
 
       <div 
         className="absolute -top-[100px] -left-[100px] w-[200px] h-[200px] rounded-full z-40"

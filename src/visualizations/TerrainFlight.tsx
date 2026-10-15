@@ -5,6 +5,7 @@ import { PERIOD, RAYMARCH_OCTAVES, terrainHeight } from './terrainMath'
 // Configuration constants
 const RENDER_SCALE = 0.5 // raymarch resolution relative to CSS pixels, then upscaled
 const MIN_RENDER_SCALE = 0.3 // floor for the automatic quality ratchet on slow GPUs
+const MAX_RENDER_PIXELS = 700_000 // cap on large/4K screens so one frame can never stall the GPU
 const SLOW_FRAME_SECONDS = 1 / 45 // average frame time that triggers a resolution drop
 const DAY_SECONDS = 240 // one full day/night cycle (night runs faster, see below)
 const NIGHT_SPEEDUP = 0.7 // night passes this much faster than day
@@ -464,10 +465,14 @@ export default function TerrainFlight() {
 
     // The raymarch renders into a small target that the blit pass stretches to the screen
     let renderScale = RENDER_SCALE
-    const targetSize = () => [
-      Math.max(1, Math.floor(window.innerWidth * renderScale)),
-      Math.max(1, Math.floor(window.innerHeight * renderScale)),
-    ]
+    const targetSize = () => {
+      const pixels = window.innerWidth * window.innerHeight * renderScale * renderScale
+      const scale = renderScale * Math.min(1, Math.sqrt(MAX_RENDER_PIXELS / Math.max(1, pixels)))
+      return [
+        Math.max(1, Math.floor(window.innerWidth * scale)),
+        Math.max(1, Math.floor(window.innerHeight * scale)),
+      ]
+    }
     const [w0, h0] = targetSize()
     const target = new THREE.WebGLRenderTarget(w0, h0, {
       minFilter: THREE.LinearFilter,
