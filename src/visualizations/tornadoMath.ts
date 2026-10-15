@@ -26,7 +26,7 @@ export function mulberry32(seed: number): Rand {
 
 export const PHYSICS_STEP = 1 / 60
 export const GRAVITY = 9.81
-export const MAX_STRUCT_BODIES = 6000 // walls, trunks, branches, cars, fences, roads...
+export const MAX_STRUCT_BODIES = 12000 // walls, trunks, branches, cars, fences, roads...
 export const MAX_BODIES = MAX_STRUCT_BODIES
 export const MAX_DUST = 1600 // CPU-advected dust puffs near the ground
 export const SCOUR_SIZE = 256 // texels per side of the ground-scour map
@@ -37,7 +37,7 @@ export const TOWN_RADIUS = 165
 export const SHARD_TRI = 0
 export const SHARD_TILE = 1
 export const TRI_POOL = 18000
-export const TILE_POOL = 20000
+export const TILE_POOL = 36000
 export const MAX_SHARDS = TRI_POOL + TILE_POOL
 const TRI_RESERVE = 1200 // kept free for leaves that burst out of a crown's interior
 const TILE_RESERVE = 3500 // kept free for splinters, glass and shredded pieces
@@ -59,7 +59,7 @@ const AIR = 0.66 // 0.5 * air density * drag coefficient
 
 // Camera legibility floor: always looking down onto the town by at least this much
 export const CAM_MIN_PITCH = (13.5 * Math.PI) / 180
-export const CAM_MIN_HEIGHT = 45
+export const CAM_MIN_HEIGHT = 28
 
 // Shapes (one InstancedMesh each; all unit-sized, centered, fitting in a unit cube)
 export const SHAPE_BOX = 0
@@ -88,6 +88,7 @@ const K_CAR = 7
 const K_POLE = 8
 const K_HEAVY = 9 // silos, bins, tanks
 const K_GLASS = 10
+const ROAD_LIFT = 0.012 // m per road; ~10x the depth precision at chase-camera range (near = 1 m)
 const BREAKABLE = [false, true, true, true, true, false, true, false, true, false, true]
 
 // Storm phases
@@ -578,14 +579,17 @@ class Builder {
   }
 
   road(x: number, z: number, ux: number, uz: number, len: number, width: number, color: number, centerLine: boolean) {
+    // Each road's top sits a little higher than the last one's, so where two cross there is
+    // always a clear winner instead of two coplanar faces fighting over the same depth
+    const top = 0.06 + this.roads.length * ROAD_LIFT
     this.roads.push({ x, z, ux, uz, len, width })
     const f = frameFacing(x, z, -uz, ux) // local x runs along the road
-    this.add(f, SHAPE_BOX, K_STATIC, 0, 0.03, 0, len, 0.06, width, color, Infinity, 1)
+    this.add(f, SHAPE_BOX, K_STATIC, 0, top / 2, 0, len, top, width, color, Infinity, 1)
     if (centerLine) {
       for (let t = -len / 2 + 6; t < len / 2 - 6; t += 12) {
         if (!this.room(80)) break
         if (Math.abs(t) > 500) continue // fog hides it beyond this anyway
-        this.add(f, SHAPE_BOX, K_STATIC, t, 0.065, 0, 4, 0.02, 0.18, CENTER_LINE, Infinity, 1)
+        this.add(f, SHAPE_BOX, K_STATIC, t, top + 0.005, 0, 4, 0.02, 0.18, CENTER_LINE, Infinity, 1)
       }
     }
   }
@@ -733,7 +737,7 @@ class Builder {
     const stories = rand() < 0.35 ? 2 : 1
     const w = range(rand, 9, 13.5)
     const d = range(rand, 7, 9.5)
-    const r = Math.hypot(w, d) / 2 + 1.5
+    const r = Math.hypot(w, d) / 2 + 0.5
     if (!this.free(x, z, r) || !this.room(48) || !this.shardRoom(SHARD_TILE, 220)) return false
     const top = 0.35 + stories * 2.8 + (d / 2) * Math.tan(0.5)
     this.begin(x, z, r, top)
@@ -745,8 +749,8 @@ class Builder {
     // Yard: a tree, a car in the drive, sometimes a shed out back
     const side = rand() < 0.5 ? -1 : 1
     if (rand() < 0.45) this.car(f.ox + f.c * side * (w / 2 + 3) + f.s * (d / 2 + 2), f.oz - f.s * side * (w / 2 + 3) + f.c * (d / 2 + 2), fz, -fx)
-    if (rand() < 0.7) this.tree(x - fx * (d / 2 + range(rand, 3, 7)) + (rand() - 0.5) * 8, z - fz * (d / 2 + range(rand, 3, 7)) + (rand() - 0.5) * 8)
-    if (rand() < 0.3) this.shed(x - fx * (d / 2 + 9) - side * fz * 4, z - fz * (d / 2 + 9) + side * fx * 4, fx, fz)
+    if (rand() < 0.4) this.tree(x - fx * (d / 2 + range(rand, 3, 7)) + (rand() - 0.5) * 8, z - fz * (d / 2 + range(rand, 3, 7)) + (rand() - 0.5) * 8)
+    if (rand() < 0.15) this.shed(x - fx * (d / 2 + 9) - side * fz * 4, z - fz * (d / 2 + 9) + side * fx * 4, fx, fz)
     return true
   }
 
@@ -1079,8 +1083,8 @@ export function generateTown(w: World, rand: Rand) {
 
   // Roads: a main highway through town, a grid of streets, gravel section roads out in the country
   b.road(0, 0, ux, uz, 2600, 9, ASPHALT, true)
-  const blockLen = range(rand, 62, 80)
-  const nStreets = rand() < 0.5 ? 1 : 2
+  const blockLen = range(rand, 52, 64)
+  const nStreets = 3
   const streets: Road[] = [b.roads[0]]
   for (let k = -nStreets; k <= nStreets; k++) {
     if (k !== 0) {
@@ -1130,11 +1134,11 @@ export function generateTown(w: World, rand: Rand) {
   // budget makes a compact town rather than a sparse one
   const lots: { x: number; z: number; fx: number; fz: number; pri: number }[] = []
   for (const road of streets) {
-    const lotW = range(rand, 19, 25)
+    const lotW = range(rand, 14, 18)
     const half = Math.min(road.len / 2, TOWN_RADIUS + 20)
     for (let t = -half + lotW / 2; t < half; t += lotW) {
       for (const side of [-1, 1]) {
-        const [x, z, fx, fz] = b.besideRoad(road, t + (rand() - 0.5) * 3, side, range(rand, 8, 11))
+        const [x, z, fx, fz] = b.besideRoad(road, t + (rand() - 0.5) * 2, side, range(rand, 8.5, 10.5))
         const dist = Math.hypot(x, z)
         if (dist > TOWN_RADIUS) continue
         lots.push({ x, z, fx, fz, pri: dist + rand() * 70 })
@@ -1146,7 +1150,7 @@ export function generateTown(w: World, rand: Rand) {
   const houseBudget = MAX_STRUCT_BODIES - 3200
   for (const lot of lots) {
     if (w.count > houseBudget || !b.shardRoom(SHARD_TILE, 3400)) break
-    if (rand() < 0.82) b.house(lot.x, lot.z, lot.fx, lot.fz)
+    if (rand() < 0.9) b.house(lot.x, lot.z, lot.fx, lot.fz)
     else if (rand() < 0.5) b.tree(lot.x, lot.z)
   }
 
@@ -2193,8 +2197,9 @@ export function createChaseCam(s: Storm, w: World, rand: Rand): ChaseCam {
     azAmp: range(rand, 0.15, 0.35),
     azFreq: range(rand, 0.025, 0.05),
     azPhase: rand() * TAU,
-    dist: Math.max(170 + 3.4 * s.RcBase, 1.3 * s.H) * (drone ? 1.12 : 1),
-    height: drone ? range(rand, 125, 160) : range(rand, 85, 115),
+    // ~60% of the original framing distance (and height, so the viewing angle is unchanged)
+    dist: Math.max(100 + 2.0 * s.RcBase, 0.8 * s.H) * (drone ? 1.12 : 1),
+    height: drone ? range(rand, 75, 96) : range(rand, 52, 70),
     pitch: range(rand, 14.5, 17.5) * (Math.PI / 180),
     drone,
   }

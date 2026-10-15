@@ -183,6 +183,7 @@ void main() {
 const GROUND_FRAG = /* glsl */ `
 uniform sampler2D uScour;
 uniform float uScourExtent;
+#define SCOUR_STRENGTH 0.2
 uniform vec3 uAmbient;
 uniform vec3 uSunColor;
 uniform vec3 uSunDir;
@@ -236,7 +237,7 @@ void main() {
   // Scoured ground: grass stripped to wet dirt, streaked
   float s = texture2D(uScour, p / uScourExtent + 0.5).r;
   vec3 soil = vec3(0.07, 0.05, 0.036) * (0.65 + 0.7 * fbm(p * 0.25));
-  albedo = mix(albedo, soil, smoothstep(0.06, 0.65, s));
+  albedo = mix(albedo, soil, SCOUR_STRENGTH * smoothstep(0.06, 0.65, s)); // a faint track, not a brown stripe
 
   // Slow shadows of the lower cloud layer
   float shade = 0.72 + 0.4 * fbm(p * 0.0022 + uTime * vec2(0.012, 0.005));
@@ -336,6 +337,8 @@ varying vec4 vFog;
 varying vec2 vRot;
 ${SKY_GLSL}
 
+#define FUNNEL_SLIM 0.7
+
 // Mirrors centerAt() in tornadoMath.ts
 vec2 centerAt(float y) {
   float h = clamp(y / uH, 0.0, 1.2);
@@ -353,14 +356,15 @@ void main() {
     // condensation funnel: a shell of puffs spiraling upward
     float h01 = fract(aSeed.x + uTime * (0.035 + 0.04 * aSeed.y));
     float y = h01 * uH;
-    float r = (uRB + (uRT - uRB) * pow(h01, 2.5)) * (0.7 + 0.4 * aSeed.w);
+    // Slimmer than the wind core's visual radius and tightly banded, so the funnel reads crisp
+    float r = (uRB + (uRT - uRB) * pow(h01, 2.5)) * FUNNEL_SLIM * (0.85 + 0.2 * aSeed.w);
     float omega = (16.0 + 10.0 * aSeed.y) / max(r, 3.0);
     float a = aSeed.z * 6.2832 - uTime * omega;
     radial = vec2(cos(a), sin(a));
     vec2 c = centerAt(y);
     wp = vec3(c.x + radial.x * r, y, c.y + radial.y * r);
-    size = min(r * 0.8 + 5.0, 48.0); // capped: the flared top would otherwise flood the GPU with overdraw
-    alpha = 0.3 * smoothstep(uBottom, uBottom + 30.0, y) * smoothstep(0.0, 0.05, h01) * (1.0 - smoothstep(0.92, 1.0, h01)) * uVis;
+    size = min(r * 0.5 + 3.0, 30.0); // smaller puffs = sharper edge; capped against overdraw
+    alpha = 0.42 * smoothstep(uBottom, uBottom + 30.0, y) * smoothstep(0.0, 0.05, h01) * (1.0 - smoothstep(0.92, 1.0, h01)) * uVis;
     float dirt = (1.0 - smoothstep(0.0, 55.0, y)) * uDebris;
     tint = mix(uFunnelTint, uDebrisTint, dirt * 0.75);
   } else {
