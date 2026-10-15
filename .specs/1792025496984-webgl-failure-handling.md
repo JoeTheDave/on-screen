@@ -19,3 +19,10 @@ itself was fine). Two problems on our side: the uncaught error unmounted the who
   menu button stays usable.
 - `TerrainFlight.tsx`: cap the raymarch target at 700k pixels (Mandelbulb already caps similarly),
   so a 4K/high-DPI screen can't produce a frame heavy enough to stall the GPU process.
+
+## Shipped — Iteration 1
+
+- Commit: b71372e (master)
+- Deploy: `flyctl deploy --remote-only` succeeded; live bundle verified to contain the boundary message.
+- Tests: none (no suite); `npm run build` + eslint on touched files clean.
+- DB backup: n/a — frontend-only.
