@@ -7,6 +7,10 @@ import { ATTRACTORS, step, warmUp, type AttractorStats } from './attractors'
 
 // Configuration constants
 const PARTICLE_COUNT = 20000
+// Bloom only on the brightest heads, and gently, so dense regions keep their structure
+const BLOOM_STRENGTH = 0.35
+const BLOOM_RADIUS = 0.4
+const BLOOM_THRESHOLD = 0.6
 const ATTRACTOR_SECONDS = 45 // time on each attractor before the equations switch
 const WORLD_SPEED = 0.35 // mean particle speed, in attractor radii per second
 const TRAIL_SECONDS = 0.15 // streak length, as seconds of travel
@@ -44,22 +48,30 @@ export default function StrangeAttractors() {
     const composer = new EffectComposer(renderer)
     composer.addPass(new RenderPass(scene, camera))
     composer.addPass(
-      new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.9, 0.6, 0.1),
+      new UnrealBloomPass(
+        new THREE.Vector2(window.innerWidth, window.innerHeight),
+        BLOOM_STRENGTH,
+        BLOOM_RADIUS,
+        BLOOM_THRESHOLD,
+      ),
     )
 
     // Each particle is one segment: head at its position, tail trailing along its velocity
     const segmentPositions = new Float32Array(PARTICLE_COUNT * 6)
-    const segmentColors = new Float32Array(PARTICLE_COUNT * 6)
+    // RGBA per vertex: the tail fades out via alpha (a dark tail color would smudge under normal blending)
+    const segmentColors = new Float32Array(PARTICLE_COUNT * 8)
     const geometry = new THREE.BufferGeometry()
     const positionAttr = new THREE.BufferAttribute(segmentPositions, 3).setUsage(THREE.DynamicDrawUsage)
-    const colorAttr = new THREE.BufferAttribute(segmentColors, 3).setUsage(THREE.DynamicDrawUsage)
+    const colorAttr = new THREE.BufferAttribute(segmentColors, 4).setUsage(THREE.DynamicDrawUsage)
     geometry.setAttribute('position', positionAttr)
     geometry.setAttribute('color', colorAttr)
     const material = new THREE.LineBasicMaterial({
       vertexColors: true,
       transparent: true,
-      opacity: 0.6,
-      blending: THREE.AdditiveBlending,
+      // Normal (not additive) blending: a lone streak shows its full color, but thousands
+      // overlapping saturate to that color instead of summing to a white blob
+      opacity: 0.55,
+      blending: THREE.NormalBlending,
       depthWrite: false,
     })
     const streaks = new THREE.LineSegments(geometry, material)
@@ -190,13 +202,13 @@ export default function StrangeAttractors() {
         const speed = Math.hypot(velocity[0], velocity[1], velocity[2]) / stats.meanSpeed
         const ratio = Math.min(speed / 1.8, 1)
         const hue = (((hueSlow + (hueFast - hueSlow) * ratio) % 1) + 1) % 1
-        color.setHSL(hue, 0.85, 0.35 + ratio * 0.3)
-        segmentColors[o] = color.r
-        segmentColors[o + 1] = color.g
-        segmentColors[o + 2] = color.b
-        segmentColors[o + 3] = color.r * 0.15
-        segmentColors[o + 4] = color.g * 0.15
-        segmentColors[o + 5] = color.b * 0.15
+        color.setHSL(hue, 0.85, 0.42 + ratio * 0.18)
+        const c = p * 8
+        segmentColors[c] = segmentColors[c + 4] = color.r
+        segmentColors[c + 1] = segmentColors[c + 5] = color.g
+        segmentColors[c + 2] = segmentColors[c + 6] = color.b
+        segmentColors[c + 3] = 1
+        segmentColors[c + 7] = 0
       }
       positionAttr.needsUpdate = true
       colorAttr.needsUpdate = true

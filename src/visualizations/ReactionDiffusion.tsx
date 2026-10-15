@@ -1,5 +1,15 @@
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
+import {
+  FLOW_BANDS,
+  FRONT_BANDS,
+  coverage,
+  createVortex,
+  createWaveField,
+  updateFlow,
+  updateFronts,
+  updateVortex,
+} from './reactionDiffusionMath'
 
 // Configuration constants
 const SIM_LONG_SIDE = 512 // sim grid texels along the screen's long axis
@@ -13,8 +23,13 @@ const MAX_DROPS = 24 // must match the size of uDrops (passed as a #define)
 const INITIAL_DROPS = 22
 const CYCLE_DROPS = 10
 const SPRINKLE_DROPS = 4
-const FEED_VARIATION = 0.004 // spatial wobble of F across the screen
-const KILL_VARIATION = 0.001 // k is far more sensitive than F, so it wobbles less
+const FLOW_SPEED = 1 // scales the stirring flow (crest speeds live in reactionDiffusionMath)
+const FLOW_WAVES = FLOW_BANDS.length // sizes of the shader's uniform arrays (#defines)
+const FRONT_WAVES = FRONT_BANDS.length
+const PROBE_SIZE = 32 // coverage probe grid, read back now and then to catch a dead/solid field
+const PROBE_SECONDS = 3
+const DEAD_COVERAGE = 0.03 // below this share of B, re-seed
+const SOLID_COVERAGE = 0.9 // above it, punch holes
 const BUMP = 3.2 // height-gradient -> normal steepness
 const LIGHT_SECONDS_X = 57
 const LIGHT_SECONDS_Y = 83
@@ -28,6 +43,12 @@ const REGIMES: [number, number][] = [
   [0.03, 0.062], // solitons: stable spots
   [0.039, 0.058], // holes / negative spots
 ]
+
+// Regime pairs whose in-between (F, k) fills solid with B, so they never share the screen or
+// glide straight into each other
+const CLASHING_PAIRS = ['2-3', '3-5'] // labyrinth/worms, worms/holes
+const clashes = (i: number, j: number) =>
+  i === j || CLASHING_PAIRS.includes(`${Math.min(i, j)}-${Math.max(i, j)}`)
 
 // [deep valley, mid body, raised peak, specular tint] — sRGB hex
 const PALETTES: [number, number, number, number][] = [
@@ -49,16 +70,29 @@ void main() {
 }
 `
 
-// One Gray-Scott step. The red channel stores (1 - A) rather than A: A sits near 1 almost
-// everywhere, where half-float spacing is ~0.0005 — coarser than the per-step changes. Near 0
-// half floats are very precise, so storing the complement keeps the reaction from stalling.
+// One advected Gray-Scott step. The red channel stores (1 - A) rather than A: A sits near 1
+// almost everywhere, where half-float spacing is ~0.0005 — coarser than the per-step changes.
+// Near 0 half floats are very precise, so storing the complement keeps the reaction from stalling.
+//
+// First the field is carried along a slow, divergence-free flow (semi-Lagrangian: read the state
+// at uv - vel). The displacement is under a texel, so the bilinear lookup is done by hand from the
+// 3x3 neighbourhood already fetched for the Laplacian — full float precision, no extra fetches,
+// and none of the 8-bit weight quantization of hardware filtering that would freeze slow regions.
+// Then feed/kill come from two regimes blended by broad traveling fronts, so as a front rolls past,
+// one kind of pattern converts into the other.
 const simFragmentShader = /* glsl */ `
 uniform sampler2D uState;
 uniform vec2 uTexel;
-uniform vec2 uFeedKill;
-uniform vec2 uVariation;
-uniform float uTime;
+uniform vec2 uSimSize;
+uniform vec2 uFeedKillA;
+uniform vec2 uFeedKillB;
+uniform vec4 uFlowWaves[FLOW_WAVES]; // kx, ky (integer, per uv), phase, unused
+uniform vec2 uFlowVel[FLOW_WAVES]; // velocity at the crest, texels/step
+uniform vec4 uFronts[FRONT_WAVES]; // kx, ky, phase, weight (weights sum to 1)
+uniform vec4 uVortex; // center (uv), radius (texels), spin
 varying vec2 vUv;
+
+const float TAU = 6.2831853;
 
 void main() {
   vec2 c = texture2D(uState, vUv).rg;
@@ -72,20 +106,37 @@ void main() {
   vec2 se = texture2D(uState, vUv + vec2(uTexel.x, -uTexel.y)).rg;
   vec2 lap = 0.2 * (n + s + e + w) + 0.05 * (ne + nw + se + sw) - c;
 
-  float a = 1.0 - c.r;
-  float b = c.g;
+  // Flow: curl of a sum of plane-wave stream functions, plus an occasional Gaussian swirl
+  vec2 vel = vec2(0.0);
+  for (int i = 0; i < FLOW_WAVES; i++) {
+    vec4 fw = uFlowWaves[i];
+    vel += uFlowVel[i] * cos(TAU * dot(fw.xy, vUv) + fw.z);
+  }
+  vec2 d = vUv - uVortex.xy;
+  d -= floor(d + 0.5); // shortest wrapped offset
+  d *= uSimSize;
+  vel += uVortex.w * exp(-dot(d, d) / (uVortex.z * uVortex.z)) * vec2(-d.y, d.x);
+  vec2 o = -clamp(vel, -0.9, 0.9); // source offset in texels, kept inside the 3x3 neighbourhood
+  vec2 f = abs(o);
+  vec2 hx = o.x > 0.0 ? e : w;
+  vec2 vy = o.y > 0.0 ? n : s;
+  vec2 cr = o.x > 0.0 ? (o.y > 0.0 ? ne : se) : (o.y > 0.0 ? nw : sw);
+  vec2 adv = mix(mix(c, hx, f.x), mix(vy, cr, f.x), f.y);
+
+  // Traveling fronts between the two regimes
+  float band = 0.0;
+  for (int i = 0; i < FRONT_WAVES; i++) {
+    vec4 fr = uFronts[i];
+    band += fr.w * sin(TAU * dot(fr.xy, vUv) + fr.z);
+  }
+  vec2 fk = mix(uFeedKillA, uFeedKillB, smoothstep(-0.3, 0.3, band));
+  float feed = fk.x;
+  float kill = fk.y;
+
+  float a = 1.0 - adv.r;
+  float b = adv.g;
   float lapA = -lap.r;
   float lapB = lap.g;
-
-  // Slowly drifting, low-frequency parameter field. Integer frequencies in uv keep it
-  // seamless across the wrapped (toroidal) edges.
-  vec2 p = vUv * 6.2831853;
-  float vf = sin(p.x + uTime * 0.031) * cos(2.0 * p.y - uTime * 0.023)
-           + 0.5 * sin(2.0 * p.x - p.y + uTime * 0.017);
-  float vk = cos(2.0 * p.x - uTime * 0.027 + 1.3) * sin(p.y + uTime * 0.019)
-           + 0.5 * cos(p.x + 2.0 * p.y + uTime * 0.013);
-  float feed = uFeedKill.x + uVariation.x * vf / 1.5;
-  float kill = uFeedKill.y + uVariation.y * vk / 1.5;
 
   float reaction = a * b * b;
   float na = a + lapA - reaction + feed * (1.0 - a);
@@ -125,6 +176,16 @@ void main() {
     }
   }
   gl_FragColor = vec4(state, 0.0, 1.0);
+}
+`
+
+// Coverage probe: B (x2, so its usual 0..0.5 range fills a byte) on a tiny 8-bit grid
+const probeFragmentShader = /* glsl */ `
+uniform sampler2D uState;
+varying vec2 vUv;
+
+void main() {
+  gl_FragColor = vec4(clamp(texture2D(uState, vUv).g * 2.0, 0.0, 1.0), 0.0, 0.0, 1.0);
 }
 `
 
@@ -223,6 +284,13 @@ const pickOther = (count: number, current: number) => {
   return next
 }
 
+// Random regime that neither equals nor clashes with any of `avoid` (always solvable: at most
+// two avoided regimes, each ruling out at most three of the six)
+const pickRegime = (...avoid: number[]) => {
+  const options = REGIMES.map((_, i) => i).filter((i) => avoid.every((a) => !clashes(i, a)))
+  return options[Math.floor(Math.random() * options.length)]
+}
+
 const smooth = (x: number) => {
   const t = Math.min(Math.max(x, 0), 1)
   return t * t * (3 - 2 * t)
@@ -257,15 +325,31 @@ export default function ReactionDiffusion() {
     const simSize = new THREE.Vector2()
     const simTexel = new THREE.Vector2()
 
+    // Flow, fronts and vortex are computed on the CPU each frame (as small Float32Arrays, then
+    // copied into these preallocated uniform vectors)
+    const flowWaves = Array.from({ length: FLOW_WAVES }, () => new THREE.Vector4())
+    const flowVel = Array.from({ length: FLOW_WAVES }, () => new THREE.Vector2())
+    const fronts = Array.from({ length: FRONT_WAVES }, () => new THREE.Vector4())
+    const vortexUniform = new THREE.Vector4(0.5, 0.5, 1, 0)
+    const flowWaveData = new Float32Array(FLOW_WAVES * 4)
+    const flowVelData = new Float32Array(FLOW_WAVES * 2)
+    const frontData = new Float32Array(FRONT_WAVES * 4)
+    const vortexData = new Float32Array(4)
+
     const simMaterial = new THREE.ShaderMaterial({
       vertexShader,
       fragmentShader: simFragmentShader,
+      defines: { FLOW_WAVES, FRONT_WAVES },
       uniforms: {
         uState: { value: null },
         uTexel: { value: simTexel },
-        uFeedKill: { value: new THREE.Vector2(...REGIMES[0]) },
-        uVariation: { value: new THREE.Vector2(FEED_VARIATION, KILL_VARIATION) },
-        uTime: { value: 0 },
+        uSimSize: { value: simSize },
+        uFeedKillA: { value: new THREE.Vector2(...REGIMES[0]) },
+        uFeedKillB: { value: new THREE.Vector2(...REGIMES[1]) },
+        uFlowWaves: { value: flowWaves },
+        uFlowVel: { value: flowVel },
+        uFronts: { value: fronts },
+        uVortex: { value: vortexUniform },
       },
       depthTest: false,
       depthWrite: false,
@@ -286,6 +370,23 @@ export default function ReactionDiffusion() {
       depthTest: false,
       depthWrite: false,
     })
+
+    const probeMaterial = new THREE.ShaderMaterial({
+      vertexShader,
+      fragmentShader: probeFragmentShader,
+      uniforms: { uState: { value: null } },
+      depthTest: false,
+      depthWrite: false,
+    })
+    const probeTarget = new THREE.WebGLRenderTarget(PROBE_SIZE, PROBE_SIZE, {
+      type: THREE.UnsignedByteType,
+      format: THREE.RGBAFormat,
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      depthBuffer: false,
+      stencilBuffer: false,
+    })
+    const probePixels = new Uint8Array(PROBE_SIZE * PROBE_SIZE * 4)
 
     const shown = toPalette(PALETTES[0])
     const displayMaterial = new THREE.ShaderMaterial({
@@ -399,12 +500,18 @@ export default function ReactionDiffusion() {
     }
     handleResize()
 
-    // Regime and palette state; both glide from where they are toward a new target
+    // Regime and palette state; both glide from where they are toward a new target. Two regimes
+    // are live at once (A and B), and the traveling fronts decide which holds where.
     let regimeIndex = Math.floor(Math.random() * REGIMES.length)
+    let regimeIndexB = pickRegime(regimeIndex)
     const feedKillFrom = new THREE.Vector2(...REGIMES[regimeIndex])
     const feedKillTo = feedKillFrom.clone()
-    const feedKill = simMaterial.uniforms.uFeedKill.value as THREE.Vector2
+    const feedKill = simMaterial.uniforms.uFeedKillA.value as THREE.Vector2
     feedKill.copy(feedKillFrom)
+    const feedKillFromB = new THREE.Vector2(...REGIMES[regimeIndexB])
+    const feedKillToB = feedKillFromB.clone()
+    const feedKillB = simMaterial.uniforms.uFeedKillB.value as THREE.Vector2
+    feedKillB.copy(feedKillFromB)
 
     let paletteIndex = Math.floor(Math.random() * PALETTES.length)
     let paletteFrom = toPalette(PALETTES[paletteIndex])
@@ -418,15 +525,53 @@ export default function ReactionDiffusion() {
     let lastTime = startTime
     let cycleStart = startTime
     let lastSprinkle = startTime
+    let lastProbe = startTime
+    let probePending = false
+    let disposed = false
     let stepDebt = 0
     let animationId = 0
+
+    const flowField = createWaveField(FLOW_BANDS, 0, Math.random)
+    const frontField = createWaveField(FRONT_BANDS, 0, Math.random)
+    const vortex = createVortex(0, Math.random)
+
+    // Now and then, read back a tiny map of B; if the field has died out or filled solid,
+    // re-seed or punch holes rather than waiting for the next scheduled drops
+    const probeCoverage = () => {
+      if (probePending || !read) return
+      probeMaterial.uniforms.uState.value = read.texture
+      runPass(probeMaterial, probeTarget)
+      probePending = true
+      renderer
+        .readRenderTargetPixelsAsync(probeTarget, 0, 0, PROBE_SIZE, PROBE_SIZE, probePixels)
+        .then(() => {
+          if (disposed) return
+          const share = coverage(probePixels)
+          if (share < DEAD_COVERAGE) {
+            scatterDrops(INITIAL_DROPS, 0)
+            applySeed(false)
+          } else if (share > SOLID_COVERAGE) {
+            scatterDrops(CYCLE_DROPS, 1)
+            applySeed(false)
+          }
+        })
+        .catch(() => {
+          // Readback unsupported or context lost: the scheduled drops still keep things going
+        })
+        .finally(() => {
+          probePending = false
+        })
+    }
 
     const startCycle = (now: number) => {
       cycleStart = now
       lastSprinkle = now
       feedKillFrom.copy(feedKill)
-      regimeIndex = pickOther(REGIMES.length, regimeIndex)
+      regimeIndex = pickRegime(regimeIndex)
       feedKillTo.set(...REGIMES[regimeIndex])
+      feedKillFromB.copy(feedKillB)
+      regimeIndexB = pickRegime(regimeIndex, regimeIndexB)
+      feedKillToB.set(...REGIMES[regimeIndexB])
       paletteFrom = {
         deep: shown.deep.clone(),
         mid: shown.mid.clone(),
@@ -456,7 +601,9 @@ export default function ReactionDiffusion() {
       }
 
       const cycleT = (now - cycleStart) / 1000
-      feedKill.lerpVectors(feedKillFrom, feedKillTo, smooth(cycleT / REGIME_BLEND_SECONDS))
+      const rb = smooth(cycleT / REGIME_BLEND_SECONDS)
+      feedKill.lerpVectors(feedKillFrom, feedKillTo, rb)
+      feedKillB.lerpVectors(feedKillFromB, feedKillToB, rb)
       const pb = smooth(cycleT / PALETTE_BLEND_SECONDS)
       shown.deep.lerpColors(paletteFrom.deep, paletteTo.deep, pb)
       shown.mid.lerpColors(paletteFrom.mid, paletteTo.mid, pb)
@@ -466,11 +613,22 @@ export default function ReactionDiffusion() {
       stepDebt += frameSeconds * STEPS_PER_SECOND
       const steps = Math.min(Math.floor(stepDebt), MAX_STEPS_PER_FRAME)
       stepDebt = Math.min(stepDebt - steps, 1)
-      simMaterial.uniforms.uTime.value = t
+      updateFlow(flowField, t, simSize.x, simSize.y, FLOW_SPEED, flowWaveData, flowVelData)
+      updateFronts(frontField, t, frontData)
+      updateVortex(vortex, t, simSize.x, simSize.y, Math.random, vortexData)
+      flowWaves.forEach((v, i) => v.fromArray(flowWaveData, i * 4))
+      flowVel.forEach((v, i) => v.fromArray(flowVelData, i * 2))
+      fronts.forEach((v, i) => v.fromArray(frontData, i * 4))
+      vortexUniform.fromArray(vortexData)
       for (let i = 0; i < steps; i++) {
         simMaterial.uniforms.uState.value = read!.texture
         runPass(simMaterial, write)
         swap()
+      }
+
+      if ((now - lastProbe) / 1000 >= PROBE_SECONDS) {
+        lastProbe = now
+        probeCoverage()
       }
 
       // Light wanders a Lissajous path just above the surface, sweeping highlights across it
@@ -490,6 +648,9 @@ export default function ReactionDiffusion() {
     return () => {
       window.removeEventListener('resize', handleResize)
       cancelAnimationFrame(animationId)
+      disposed = true
+      probeTarget.dispose()
+      probeMaterial.dispose()
       read?.dispose()
       write?.dispose()
       geometry.dispose()
