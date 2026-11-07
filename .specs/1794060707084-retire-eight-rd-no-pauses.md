@@ -23,3 +23,9 @@ begin immediately.
   limit). Needs Joe to run `flyctl auth login` (browser), then `fly deploy --remote-only`.
   Live site still serves the previous build.
 - Tests: none (no suite); tsc, full eslint, build clean. Not verified visually. DB backup: n/a.
+
+## Shipped — Iteration 1
+
+- Commit: b68edab (master); deployed after Joe re-ran `flyctl auth login`.
+- Deploy: `flyctl deploy --remote-only` succeeded; live bundle verified: the eight retired ids absent, reaction-diffusion/tornado present.
+- Tests: none (no suite); tsc, full eslint, build clean. Not verified visually. DB backup: n/a.
