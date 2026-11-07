@@ -65,10 +65,13 @@ export const FAR = 4096 // front radius that puts every texel behind the front
 export const FRONT_SPEED = 10 // texels per sim-second the front aims for
 export const MIN_SWEEP_SECONDS = 20
 export const MAX_SWEEP_SECONDS = 34
-export const TRANSFORM_HOLD_SECONDS = 6 // after the sweep, let the trailing edge finish converting
-export const SPREAD_SECONDS = 15 // 22 drops fill the screen in ~9 s; a few seconds to admire it
+// No pause between phases: the next front sets off the moment the last one has crossed the screen.
+// Anything still converting behind it keeps converting (the new front's 'ahead' regime is the
+// same one), so nothing is lost by not waiting.
+export const TRANSFORM_HOLD_SECONDS = 0
+export const SPREAD_SECONDS = 10 // 22 drops fill the screen in ~9 s; the first front follows right on
 export const RESET_SWEEP_SECONDS = 15
-export const RESET_HOLD_SECONDS = 2
+export const RESET_HOLD_SECONDS = 0
 export const MIN_TRANSFORMS = 3
 export const MAX_TRANSFORMS = 5
 const SEEDED_DENSITY = [0.3, 0.42]

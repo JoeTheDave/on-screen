@@ -5,10 +5,10 @@ import FourierEpicycles from './visualizations/FourierEpicycles'
 import ParticleFlowField from './visualizations/ParticleFlowField'
 import FlockingBoids from './visualizations/FlockingBoids'
 import ConwayGameOfLife from './visualizations/ConwayGameOfLife'
-import VoronoiDiagrams from './visualizations/VoronoiDiagrams'
-import CircularVoronoi from './visualizations/CircularVoronoi'
-import OrbitingLights from './visualizations/OrbitingLights'
-import SphereField from './visualizations/SphereField'
+// import VoronoiDiagrams from './visualizations/VoronoiDiagrams'
+// import CircularVoronoi from './visualizations/CircularVoronoi'
+// import OrbitingLights from './visualizations/OrbitingLights'
+// import SphereField from './visualizations/SphereField'
 import Epicycles3D from './visualizations/Epicycles3D'
 import WaveGrid from './visualizations/WaveGrid'
 import StrangeAttractors from './visualizations/StrangeAttractors'
@@ -16,12 +16,12 @@ import ReactionDiffusion from './visualizations/ReactionDiffusion'
 import Aurora from './visualizations/Aurora'
 import GalaxyCollision from './visualizations/GalaxyCollision'
 import InkFluid from './visualizations/InkFluid'
-import BlackHole from './visualizations/BlackHole'
+// import BlackHole from './visualizations/BlackHole'
 import Hypercube from './visualizations/Hypercube'
-import TerrainFlight from './visualizations/TerrainFlight'
+// import TerrainFlight from './visualizations/TerrainFlight'
 import Tornado from './visualizations/Tornado'
-import AtomicBomb from './visualizations/AtomicBomb'
-import Prism from './visualizations/Prism'
+// import AtomicBomb from './visualizations/AtomicBomb'
+// import Prism from './visualizations/Prism'
 // import Snakes from './visualizations/Snakes'
 
 const VISUALIZATIONS = [
@@ -30,23 +30,24 @@ const VISUALIZATIONS = [
   { id: 'flow-field', name: 'Particle Flow Field', component: ParticleFlowField },
   { id: 'flocking-boids', name: 'Flocking Boids', component: FlockingBoids },
   { id: 'game-of-life', name: "Game of Life", component: ConwayGameOfLife },
-  { id: 'voronoi', name: 'Voronoi Diagram', component: VoronoiDiagrams },
-  { id: 'circular-voronoi', name: 'Circular Voronoi', component: CircularVoronoi },
-  { id: 'orbiting-lights', name: 'Orbiting Lights', component: OrbitingLights },
-  { id: 'sphere-field', name: 'Sphere Field', component: SphereField },
+  // { id: 'voronoi', name: 'Voronoi Diagram', component: VoronoiDiagrams },
+  // { id: 'circular-voronoi', name: 'Circular Voronoi', component: CircularVoronoi },
+  // { id: 'orbiting-lights', name: 'Orbiting Lights', component: OrbitingLights },
+  // { id: 'sphere-field', name: 'Sphere Field', component: SphereField },
   { id: 'wave-grid', name: 'Wave Grid', component: WaveGrid },
   { id: 'strange-attractors', name: 'Strange Attractors', component: StrangeAttractors },
   { id: 'reaction-diffusion', name: 'Reaction Diffusion', component: ReactionDiffusion },
   { id: 'aurora', name: 'Aurora', component: Aurora },
   { id: 'galaxy-collision', name: 'Galaxy Collision', component: GalaxyCollision },
   { id: 'ink-fluid', name: 'Ink in Water', component: InkFluid },
-  { id: 'black-hole', name: 'Black Hole', component: BlackHole },
+  // { id: 'black-hole', name: 'Black Hole', component: BlackHole },
   { id: 'hypercube', name: 'Hypercube', component: Hypercube },
-  { id: 'terrain-flight', name: 'Terrain Flight', component: TerrainFlight },
+  // { id: 'terrain-flight', name: 'Terrain Flight', component: TerrainFlight },
   { id: 'tornado', name: 'Tornado', component: Tornado },
-  { id: 'atomic-bomb', name: 'Atomic Bomb', component: AtomicBomb },
-  { id: 'prism', name: 'Prism', component: Prism },
+  // { id: 'atomic-bomb', name: 'Atomic Bomb', component: AtomicBomb },
+  // { id: 'prism', name: 'Prism', component: Prism },
   // { id: 'snakes', name: 'Snakes', component: Snakes },
+  // Retired entries above are commented out on purpose: off the menu, code kept (Joe, 2026-11-07)
 ]
 
 const STORAGE_KEY = 'on-screen-current-viz'

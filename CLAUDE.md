@@ -8,6 +8,7 @@
 - **Frontend-only.** No backend, no database, no auth. Do not add Express, Prisma, or any server-side infrastructure.
 - **Screen Wake Lock lives in `main.tsx`**, not in any component. Keep it there.
 - **Snakes is shelved** — `src/visualizations/Snakes.tsx` exists but is intentionally commented out in `App.tsx`. Do not delete it; do not re-enable it without being asked.
+- **Retired visualizations** (2026-11-07): Voronoi Diagram, Circular Voronoi, Orbiting Lights, Sphere Field, Black Hole, Terrain Flight, Atomic Bomb, Prism are commented out of `App.tsx` the same way — off the menu, code kept. Same rule: don't delete, don't re-enable unless asked.
 
 ## Local Dev
 
