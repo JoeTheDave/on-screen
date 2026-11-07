@@ -16,8 +16,10 @@ begin immediately.
   (drops fill in ~9 s). The next front launches the instant the previous one has crossed the
   screen; anything still converting keeps converting under the same regime.
 
-## Shipped — Iteration 1
+## Pushed, not deployed — Iteration 1
 
-- Commit: b68edab (master)
-- Deploy: `flyctl deploy --remote-only` succeeded; live bundle verified: the eight retired ids absent, reaction-diffusion/tornado present.
+- Commit: b68edab (master), pushed.
+- Deploy BLOCKED: `flyctl deploy` failed — Fly auth token expired (last login 2026-10-02; 30-day
+  limit). Needs Joe to run `flyctl auth login` (browser), then `fly deploy --remote-only`.
+  Live site still serves the previous build.
 - Tests: none (no suite); tsc, full eslint, build clean. Not verified visually. DB backup: n/a.
